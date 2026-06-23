@@ -136,6 +136,7 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
   serial_workspace_.marks.assign(static_cast<size_t>(n_), 0);
   serial_workspace_.touched.reserve(static_cast<size_t>(std::min(n_, 1 << 20)));
   serial_workspace_.epoch = 1;
+  EnsurePrepareWorkspace(&sequential_prepare_workspace_);
   scratch_counts_.assign(static_cast<size_t>(n_), 0);
   scratch_marks_.assign(static_cast<size_t>(n_), 0);
   scratch_touched_.reserve(static_cast<size_t>(std::min(n_, 1 << 20)));
@@ -1062,9 +1063,8 @@ Sweg::LocalGainResult Sweg::ComputeLocalEncodingGain(const SparseCounts& agg_a,
 
 Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
     const std::vector<int>& q) {
-  PrepareWorkspace workspace;
   EaPrepareResult result = PrepareBatchEncodingAwareGroupWithWorkspace(
-      q, &workspace, true);
+      q, &sequential_prepare_workspace_, true);
   AccumulatePrepareStats(result.stats);
   return std::move(result.prepared);
 }

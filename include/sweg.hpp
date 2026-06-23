@@ -392,6 +392,7 @@ class Sweg {
   std::shared_ptr<CudaScoringCache> cuda_cache_;
   size_t cuda_verify_samples_remaining_ = 0;
   uint64_t cuda_verify_call_counter_ = 0;
+  mutable PrepareWorkspace sequential_prepare_workspace_;
   mutable ParallelScratch serial_workspace_;
   mutable std::vector<PrepareWorkspace> prepare_workspaces_;
   mutable std::vector<int64_t> scratch_counts_;
