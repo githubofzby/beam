@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -89,6 +90,58 @@ struct DeviceLocalGainResult {
   int64_t gain;
   int64_t before_cost;
 };
+
+struct PackedCudaInputLayout {
+  size_t total_bytes = 0;
+  size_t offsets_offset = 0;
+  size_t row_rep_ids_offset = 0;
+  size_t neighbors_offset = 0;
+  size_t weights_offset = 0;
+  size_t neighbor_sizes_offset = 0;
+  size_t row_sizes_offset = 0;
+  size_t row_self_loops_offset = 0;
+  size_t pairs_offset = 0;
+};
+
+size_t AlignUp(size_t value, size_t alignment) {
+  if (alignment <= 1) {
+    return value;
+  }
+  const size_t remainder = value % alignment;
+  return remainder == 0 ? value : (value + alignment - remainder);
+}
+
+template <typename T>
+size_t AppendPackedSection(size_t offset, size_t count, size_t* section_offset) {
+  offset = AlignUp(offset, alignof(T));
+  if (section_offset != nullptr) {
+    *section_offset = offset;
+  }
+  return offset + sizeof(T) * count;
+}
+
+PackedCudaInputLayout BuildPackedCudaInputLayout(
+    const Sweg::FlatAggCSR& flat_agg, size_t pair_count) {
+  PackedCudaInputLayout layout;
+  size_t offset = 0;
+  offset = AppendPackedSection<int>(offset, flat_agg.offsets.size(),
+                                    &layout.offsets_offset);
+  offset = AppendPackedSection<int>(offset, flat_agg.row_rep_ids.size(),
+                                    &layout.row_rep_ids_offset);
+  offset = AppendPackedSection<int>(offset, flat_agg.neighbors.size(),
+                                    &layout.neighbors_offset);
+  offset = AppendPackedSection<int64_t>(offset, flat_agg.weights.size(),
+                                        &layout.weights_offset);
+  offset = AppendPackedSection<int64_t>(offset, flat_agg.neighbor_sizes.size(),
+                                        &layout.neighbor_sizes_offset);
+  offset = AppendPackedSection<int64_t>(offset, flat_agg.row_sizes.size(),
+                                        &layout.row_sizes_offset);
+  offset = AppendPackedSection<int64_t>(offset, flat_agg.row_self_loops.size(),
+                                        &layout.row_self_loops_offset);
+  offset = AppendPackedSection<int2>(offset, pair_count, &layout.pairs_offset);
+  layout.total_bytes = offset;
+  return layout;
+}
 
 inline Sweg::LocalGainResult ComputeLocalGainHostFromFlat(
     const Sweg::FlatAggCSR& flat_agg, int a_idx, int b_idx) {
@@ -317,219 +370,164 @@ struct Sweg::CudaScoringCache {
   size_t slice_memory_budget_bytes = 0;
   bool slice_memory_budget_initialized = false;
 
-  int* d_offsets = nullptr;
-  int* d_row_rep_ids = nullptr;
-  int* d_neighbors = nullptr;
-  int64_t* d_weights = nullptr;
-  int64_t* d_neighbor_sizes = nullptr;
-  int64_t* d_row_sizes = nullptr;
-  int64_t* d_row_self_loops = nullptr;
+  void* h_input_blob = nullptr;
+  void* d_input_blob = nullptr;
+  DeviceLocalGainResult* h_results = nullptr;
+  DeviceLocalGainResult* d_results = nullptr;
+  size_t input_capacity = 0;
+  size_t output_capacity = 0;
 
-  size_t offset_capacity = 0;
-  size_t row_rep_capacity = 0;
-  size_t neighbor_capacity = 0;
-  size_t weight_capacity = 0;
-  size_t neighbor_size_capacity = 0;
-  size_t row_size_capacity = 0;
-  size_t row_self_loop_capacity = 0;
-
-  struct Slot {
-    int2* d_pairs = nullptr;
-    DeviceLocalGainResult* d_results = nullptr;
-    int2* h_pairs = nullptr;
-    DeviceLocalGainResult* h_results = nullptr;
-    size_t capacity = 0;
-    cudaStream_t stream = nullptr;
-    cudaEvent_t h2d_start = nullptr;
-    cudaEvent_t h2d_end = nullptr;
-    cudaEvent_t kernel_end = nullptr;
-    cudaEvent_t d2h_end = nullptr;
-    bool in_flight = false;
-    size_t result_offset = 0;
-    size_t result_count = 0;
-  };
-
-  static constexpr int kSlotCount = 2;
-  Slot slots[kSlotCount];
+  cudaStream_t transfer_stream = nullptr;
+  cudaStream_t compute_streams[2] = {nullptr, nullptr};
+  cudaEvent_t input_ready = nullptr;
+  cudaEvent_t compute_done[2] = {nullptr, nullptr};
+  cudaEvent_t result_ready = nullptr;
+  cudaEvent_t packed_h2d_start = nullptr;
+  cudaEvent_t packed_h2d_end = nullptr;
+  cudaEvent_t packed_d2h_start = nullptr;
+  cudaEvent_t packed_d2h_end = nullptr;
+  std::vector<cudaEvent_t> kernel_start_events;
+  std::vector<cudaEvent_t> kernel_end_events;
 
   CudaScoringCache() {
     try {
-      for (Slot& slot : slots) {
-        CheckCuda(
-            cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking),
-            "cudaStreamCreateWithFlags");
-        CheckCuda(cudaEventCreate(&slot.h2d_start), "cudaEventCreate(h2d)");
-        CheckCuda(cudaEventCreate(&slot.h2d_end), "cudaEventCreate(h2d_end)");
-        CheckCuda(cudaEventCreate(&slot.kernel_end),
-                  "cudaEventCreate(kernel_end)");
-        CheckCuda(cudaEventCreate(&slot.d2h_end), "cudaEventCreate(d2h_end)");
+      CheckCuda(
+          cudaStreamCreateWithFlags(&transfer_stream, cudaStreamNonBlocking),
+          "cudaStreamCreateWithFlags(transfer)");
+      for (int i = 0; i < 2; ++i) {
+        CheckCuda(cudaStreamCreateWithFlags(&compute_streams[i],
+                                            cudaStreamNonBlocking),
+                  "cudaStreamCreateWithFlags(compute)");
       }
+      CheckCuda(cudaEventCreate(&input_ready), "cudaEventCreate(input_ready)");
+      CheckCuda(cudaEventCreate(&compute_done[0]),
+                "cudaEventCreate(compute_done0)");
+      CheckCuda(cudaEventCreate(&compute_done[1]),
+                "cudaEventCreate(compute_done1)");
+      CheckCuda(cudaEventCreate(&result_ready), "cudaEventCreate(result_ready)");
+      CheckCuda(cudaEventCreate(&packed_h2d_start),
+                "cudaEventCreate(packed_h2d_start)");
+      CheckCuda(cudaEventCreate(&packed_h2d_end),
+                "cudaEventCreate(packed_h2d_end)");
+      CheckCuda(cudaEventCreate(&packed_d2h_start),
+                "cudaEventCreate(packed_d2h_start)");
+      CheckCuda(cudaEventCreate(&packed_d2h_end),
+                "cudaEventCreate(packed_d2h_end)");
     } catch (...) {
-      for (Slot& slot : slots) {
-        FreeDeviceNoThrow(slot.d_pairs);
-        FreeDeviceNoThrow(slot.d_results);
-        FreeHostNoThrow(slot.h_pairs);
-        FreeHostNoThrow(slot.h_results);
-        DestroyEventNoThrow(slot.h2d_start);
-        DestroyEventNoThrow(slot.h2d_end);
-        DestroyEventNoThrow(slot.kernel_end);
-        DestroyEventNoThrow(slot.d2h_end);
-        DestroyStreamNoThrow(slot.stream);
-        slot = Slot{};
+      FreeHostNoThrow(h_input_blob);
+      FreeDeviceNoThrow(d_input_blob);
+      FreeHostNoThrow(h_results);
+      FreeDeviceNoThrow(d_results);
+      DestroyEventNoThrow(input_ready);
+      DestroyEventNoThrow(compute_done[0]);
+      DestroyEventNoThrow(compute_done[1]);
+      DestroyEventNoThrow(result_ready);
+      DestroyEventNoThrow(packed_h2d_start);
+      DestroyEventNoThrow(packed_h2d_end);
+      DestroyEventNoThrow(packed_d2h_start);
+      DestroyEventNoThrow(packed_d2h_end);
+      for (cudaEvent_t event : kernel_start_events) {
+        DestroyEventNoThrow(event);
+      }
+      for (cudaEvent_t event : kernel_end_events) {
+        DestroyEventNoThrow(event);
+      }
+      DestroyStreamNoThrow(transfer_stream);
+      for (int i = 0; i < 2; ++i) {
+        DestroyStreamNoThrow(compute_streams[i]);
       }
       throw;
     }
   }
 
   ~CudaScoringCache() {
-    for (Slot& slot : slots) {
-      if (slot.in_flight && slot.d2h_end != nullptr) {
-        cudaEventSynchronize(slot.d2h_end);
-      }
-      FreeDeviceNoThrow(slot.d_pairs);
-      FreeDeviceNoThrow(slot.d_results);
-      FreeHostNoThrow(slot.h_pairs);
-      FreeHostNoThrow(slot.h_results);
-      DestroyEventNoThrow(slot.h2d_start);
-      DestroyEventNoThrow(slot.h2d_end);
-      DestroyEventNoThrow(slot.kernel_end);
-      DestroyEventNoThrow(slot.d2h_end);
-      DestroyStreamNoThrow(slot.stream);
-      slot = Slot{};
+    if (transfer_stream != nullptr) {
+      cudaStreamSynchronize(transfer_stream);
     }
-
-    FreeDeviceNoThrow(d_offsets);
-    FreeDeviceNoThrow(d_row_rep_ids);
-    FreeDeviceNoThrow(d_neighbors);
-    FreeDeviceNoThrow(d_weights);
-    FreeDeviceNoThrow(d_neighbor_sizes);
-    FreeDeviceNoThrow(d_row_sizes);
-    FreeDeviceNoThrow(d_row_self_loops);
+    for (int i = 0; i < 2; ++i) {
+      if (compute_streams[i] != nullptr) {
+        cudaStreamSynchronize(compute_streams[i]);
+      }
+    }
+    FreeHostNoThrow(h_input_blob);
+    FreeDeviceNoThrow(d_input_blob);
+    FreeHostNoThrow(h_results);
+    FreeDeviceNoThrow(d_results);
+    DestroyEventNoThrow(input_ready);
+    DestroyEventNoThrow(compute_done[0]);
+    DestroyEventNoThrow(compute_done[1]);
+    DestroyEventNoThrow(result_ready);
+    DestroyEventNoThrow(packed_h2d_start);
+    DestroyEventNoThrow(packed_h2d_end);
+    DestroyEventNoThrow(packed_d2h_start);
+    DestroyEventNoThrow(packed_d2h_end);
+    for (cudaEvent_t event : kernel_start_events) {
+      DestroyEventNoThrow(event);
+    }
+    for (cudaEvent_t event : kernel_end_events) {
+      DestroyEventNoThrow(event);
+    }
+    DestroyStreamNoThrow(transfer_stream);
+    for (int i = 0; i < 2; ++i) {
+      DestroyStreamNoThrow(compute_streams[i]);
+    }
   }
 
-  void EnsureSlotCapacity(Slot* slot, size_t required) {
-    if (slot == nullptr || slot->capacity >= required) {
+  void EnsureInputCapacity(size_t required_bytes) {
+    if (input_capacity >= required_bytes) {
       return;
     }
-
-    if (slot->in_flight) {
-      CheckCuda(cudaEventSynchronize(slot->d2h_end), "wait slot before resize");
-      slot->in_flight = false;
+    const size_t new_capacity = GrowCapacity(input_capacity, required_bytes);
+    FreeHostNoThrow(h_input_blob);
+    FreeDeviceNoThrow(d_input_blob);
+    h_input_blob = nullptr;
+    d_input_blob = nullptr;
+    if (new_capacity == 0) {
+      input_capacity = 0;
+      return;
     }
+    CheckCuda(cudaHostAlloc(&h_input_blob, new_capacity, cudaHostAllocDefault),
+              "cudaHostAlloc h_input_blob");
+    CheckCuda(cudaMalloc(&d_input_blob, new_capacity),
+              "cudaMalloc d_input_blob");
+    input_capacity = new_capacity;
+  }
 
-    const size_t new_capacity = GrowCapacity(slot->capacity, required);
-
-    FreeDeviceNoThrow(slot->d_pairs);
-    FreeDeviceNoThrow(slot->d_results);
-    FreeHostNoThrow(slot->h_pairs);
-    FreeHostNoThrow(slot->h_results);
-    slot->d_pairs = nullptr;
-    slot->d_results = nullptr;
-    slot->h_pairs = nullptr;
-    slot->h_results = nullptr;
-
-    CheckCuda(cudaMalloc(reinterpret_cast<void**>(&slot->d_pairs),
-                         sizeof(int2) * new_capacity),
-              "cudaMalloc slot d_pairs");
-    CheckCuda(cudaMalloc(reinterpret_cast<void**>(&slot->d_results),
-                         sizeof(DeviceLocalGainResult) * new_capacity),
-              "cudaMalloc slot d_results");
-    CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&slot->h_pairs),
-                            sizeof(int2) * new_capacity, cudaHostAllocDefault),
-              "cudaHostAlloc slot h_pairs");
-    CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&slot->h_results),
+  void EnsureOutputCapacity(size_t required_results) {
+    if (output_capacity >= required_results) {
+      return;
+    }
+    const size_t new_capacity = GrowCapacity(output_capacity, required_results);
+    FreeHostNoThrow(h_results);
+    FreeDeviceNoThrow(d_results);
+    h_results = nullptr;
+    d_results = nullptr;
+    if (new_capacity == 0) {
+      output_capacity = 0;
+      return;
+    }
+    CheckCuda(cudaHostAlloc(reinterpret_cast<void**>(&h_results),
                             sizeof(DeviceLocalGainResult) * new_capacity,
                             cudaHostAllocDefault),
-              "cudaHostAlloc slot h_results");
-
-    slot->capacity = new_capacity;
+              "cudaHostAlloc h_results");
+    CheckCuda(cudaMalloc(reinterpret_cast<void**>(&d_results),
+                         sizeof(DeviceLocalGainResult) * new_capacity),
+              "cudaMalloc d_results");
+    output_capacity = new_capacity;
   }
 
-  void AccumulateSlotTiming(Slot& slot, RuntimeStats* stats) const {
-    if (stats == nullptr || slot.result_count == 0) {
+  void EnsureKernelEventCapacity(size_t required) {
+    if (kernel_start_events.size() >= required) {
       return;
     }
-
-    float h2d_ms = 0.0f;
-    float kernel_ms = 0.0f;
-    float d2h_ms = 0.0f;
-    CheckCuda(cudaEventElapsedTime(&h2d_ms, slot.h2d_start, slot.h2d_end),
-              "cudaEventElapsedTime(h2d)");
-    CheckCuda(cudaEventElapsedTime(&kernel_ms, slot.h2d_end, slot.kernel_end),
-              "cudaEventElapsedTime(kernel)");
-    CheckCuda(cudaEventElapsedTime(&d2h_ms, slot.kernel_end, slot.d2h_end),
-              "cudaEventElapsedTime(d2h)");
-    stats->cuda_pair_h2d_ms += static_cast<double>(h2d_ms);
-    stats->cuda_h2d_ms += static_cast<double>(h2d_ms);
-    stats->cuda_kernel_ms += static_cast<double>(kernel_ms);
-    stats->cuda_d2h_ms += static_cast<double>(d2h_ms);
-  }
-
-  void UploadResidentRows(const Sweg::FlatAggCSR& flat,
-                          RuntimeStats* stats) {
-    EnsureDeviceCapacity(&d_offsets, &offset_capacity, flat.offsets.size(),
-                         "cudaMalloc d_offsets");
-    EnsureDeviceCapacity(&d_row_rep_ids, &row_rep_capacity,
-                         flat.row_rep_ids.size(), "cudaMalloc d_row_rep_ids");
-    EnsureDeviceCapacity(&d_neighbors, &neighbor_capacity,
-                         flat.neighbors.size(), "cudaMalloc d_neighbors");
-    EnsureDeviceCapacity(&d_weights, &weight_capacity, flat.weights.size(),
-                         "cudaMalloc d_weights");
-    EnsureDeviceCapacity(&d_neighbor_sizes, &neighbor_size_capacity,
-                         flat.neighbor_sizes.size(),
-                         "cudaMalloc d_neighbor_sizes");
-    EnsureDeviceCapacity(&d_row_sizes, &row_size_capacity,
-                         flat.row_sizes.size(), "cudaMalloc d_row_sizes");
-    EnsureDeviceCapacity(&d_row_self_loops, &row_self_loop_capacity,
-                         flat.row_self_loops.size(),
-                         "cudaMalloc d_row_self_loops");
-
-    const auto upload_start = Clock::now();
-    CheckCuda(cudaMemcpy(d_offsets, flat.offsets.data(),
-                         sizeof(int) * flat.offsets.size(),
-                         cudaMemcpyHostToDevice),
-              "upload offsets");
-    CheckCuda(cudaMemcpy(d_row_rep_ids, flat.row_rep_ids.data(),
-                         sizeof(int) * flat.row_rep_ids.size(),
-                         cudaMemcpyHostToDevice),
-              "upload row_rep_ids");
-    CheckCuda(cudaMemcpy(d_neighbors, flat.neighbors.data(),
-                         sizeof(int) * flat.neighbors.size(),
-                         cudaMemcpyHostToDevice),
-              "upload neighbors");
-    CheckCuda(cudaMemcpy(d_weights, flat.weights.data(),
-                         sizeof(int64_t) * flat.weights.size(),
-                         cudaMemcpyHostToDevice),
-              "upload weights");
-    CheckCuda(cudaMemcpy(d_neighbor_sizes, flat.neighbor_sizes.data(),
-                         sizeof(int64_t) * flat.neighbor_sizes.size(),
-                         cudaMemcpyHostToDevice),
-              "upload neighbor_sizes");
-    CheckCuda(cudaMemcpy(d_row_sizes, flat.row_sizes.data(),
-                         sizeof(int64_t) * flat.row_sizes.size(),
-                         cudaMemcpyHostToDevice),
-              "upload row_sizes");
-    CheckCuda(cudaMemcpy(d_row_self_loops, flat.row_self_loops.data(),
-                         sizeof(int64_t) * flat.row_self_loops.size(),
-                         cudaMemcpyHostToDevice),
-              "upload row_self_loops");
-    const auto upload_end = Clock::now();
-
-    if (stats != nullptr) {
-      const uint64_t row_bytes =
-          static_cast<uint64_t>(sizeof(int) * flat.offsets.size()) +
-          static_cast<uint64_t>(sizeof(int) * flat.row_rep_ids.size()) +
-          static_cast<uint64_t>(sizeof(int) * flat.neighbors.size()) +
-          static_cast<uint64_t>(sizeof(int64_t) * flat.weights.size()) +
-          static_cast<uint64_t>(sizeof(int64_t) * flat.neighbor_sizes.size()) +
-          static_cast<uint64_t>(sizeof(int64_t) * flat.row_sizes.size()) +
-          static_cast<uint64_t>(sizeof(int64_t) *
-                                flat.row_self_loops.size());
-      const double elapsed = ElapsedMs(upload_start, upload_end);
-      stats->cuda_row_h2d_ms += elapsed;
-      stats->cuda_h2d_ms += elapsed;
-      stats->cuda_row_uploads += 1;
-      stats->cuda_h2d_bytes += static_cast<int64_t>(row_bytes);
+    const size_t old_size = kernel_start_events.size();
+    kernel_start_events.resize(required, nullptr);
+    kernel_end_events.resize(required, nullptr);
+    for (size_t i = old_size; i < required; ++i) {
+      CheckCuda(cudaEventCreate(&kernel_start_events[i]),
+                "cudaEventCreate(kernel_start)");
+      CheckCuda(cudaEventCreate(&kernel_end_events[i]),
+                "cudaEventCreate(kernel_end)");
     }
   }
 };
@@ -726,8 +724,6 @@ std::vector<Sweg::LocalGainResult> Sweg::ScoreCandidatesCuda(
   const auto cuda_total_start = Clock::now();
   stats_.cuda_num_calls += 1;
 
-  cache.UploadResidentRows(flat_agg, &stats_);
-
   std::vector<LocalGainResult> results(candidate_pairs.size());
   const size_t chunk_size =
       candidate_chunk_size == 0
@@ -735,86 +731,147 @@ std::vector<Sweg::LocalGainResult> Sweg::ScoreCandidatesCuda(
           : std::max<size_t>(1, std::min(candidate_chunk_size,
                                          candidate_pairs.size()));
 
-  auto collect_slot = [&](CudaScoringCache::Slot& slot) {
-    if (!slot.in_flight) {
-      return;
+  const PackedCudaInputLayout layout =
+      BuildPackedCudaInputLayout(flat_agg, candidate_pairs.size());
+  cache.EnsureInputCapacity(layout.total_bytes);
+  cache.EnsureOutputCapacity(candidate_pairs.size());
+
+  auto copy_vec = [&](size_t offset, const auto& vec) {
+    using T = typename std::decay_t<decltype(vec)>::value_type;
+    if (!vec.empty()) {
+      std::memcpy(static_cast<char*>(cache.h_input_blob) + offset, vec.data(),
+                  sizeof(T) * vec.size());
     }
-
-    CheckCuda(cudaEventSynchronize(slot.d2h_end), "wait scoring slot");
-
-    for (size_t i = 0; i < slot.result_count; ++i) {
-      const DeviceLocalGainResult& src = slot.h_results[i];
-      LocalGainResult& dst = results[slot.result_offset + i];
-      dst.gain = src.gain;
-      dst.before_cost = src.before_cost;
-    }
-
-    cache.AccumulateSlotTiming(slot, &stats_);
-    slot.in_flight = false;
   };
 
-  size_t offset = 0;
-  size_t launch_index = 0;
-  while (offset < candidate_pairs.size()) {
-    CudaScoringCache::Slot& slot =
-        cache.slots[launch_index % CudaScoringCache::kSlotCount];
-    collect_slot(slot);
+  copy_vec(layout.offsets_offset, flat_agg.offsets);
+  copy_vec(layout.row_rep_ids_offset, flat_agg.row_rep_ids);
+  copy_vec(layout.neighbors_offset, flat_agg.neighbors);
+  copy_vec(layout.weights_offset, flat_agg.weights);
+  copy_vec(layout.neighbor_sizes_offset, flat_agg.neighbor_sizes);
+  copy_vec(layout.row_sizes_offset, flat_agg.row_sizes);
+  copy_vec(layout.row_self_loops_offset, flat_agg.row_self_loops);
+  int2* h_pairs = reinterpret_cast<int2*>(
+      static_cast<char*>(cache.h_input_blob) + layout.pairs_offset);
+  for (size_t i = 0; i < candidate_pairs.size(); ++i) {
+    h_pairs[i] = make_int2(candidate_pairs[i].first, candidate_pairs[i].second);
+  }
 
-    const size_t count =
-        std::min(chunk_size, candidate_pairs.size() - offset);
-    cache.EnsureSlotCapacity(&slot, count);
+  CheckCuda(cudaEventRecord(cache.packed_h2d_start, cache.transfer_stream),
+            "cudaEventRecord(packed_h2d_start)");
+  CheckCuda(cudaMemcpyAsync(cache.d_input_blob, cache.h_input_blob,
+                            layout.total_bytes, cudaMemcpyHostToDevice,
+                            cache.transfer_stream),
+            "cudaMemcpyAsync packed input");
+  CheckCuda(cudaEventRecord(cache.packed_h2d_end, cache.transfer_stream),
+            "cudaEventRecord(packed_h2d_end)");
+  CheckCuda(cudaEventRecord(cache.input_ready, cache.transfer_stream),
+            "cudaEventRecord(input_ready)");
 
-    for (size_t i = 0; i < count; ++i) {
-      const auto& pair = candidate_pairs[offset + i];
-      slot.h_pairs[i] = make_int2(pair.first, pair.second);
-    }
+  const int* d_offsets = reinterpret_cast<const int*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.offsets_offset);
+  const int* d_row_rep_ids = reinterpret_cast<const int*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.row_rep_ids_offset);
+  const int* d_neighbors = reinterpret_cast<const int*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.neighbors_offset);
+  const int64_t* d_weights = reinterpret_cast<const int64_t*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.weights_offset);
+  const int64_t* d_neighbor_sizes = reinterpret_cast<const int64_t*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.neighbor_sizes_offset);
+  const int64_t* d_row_sizes = reinterpret_cast<const int64_t*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.row_sizes_offset);
+  const int64_t* d_row_self_loops = reinterpret_cast<const int64_t*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.row_self_loops_offset);
+  const int2* d_pairs = reinterpret_cast<const int2*>(
+      static_cast<const char*>(cache.d_input_blob) + layout.pairs_offset);
 
-    slot.result_offset = offset;
-    slot.result_count = count;
+  const size_t num_chunks =
+      chunk_size == 0 ? 0 : (candidate_pairs.size() + chunk_size - 1) / chunk_size;
+  cache.EnsureKernelEventCapacity(num_chunks);
 
-    CheckCuda(cudaEventRecord(slot.h2d_start, slot.stream),
-              "cudaEventRecord(h2d_start)");
-    CheckCuda(cudaMemcpyAsync(slot.d_pairs, slot.h_pairs, sizeof(int2) * count,
-                              cudaMemcpyHostToDevice, slot.stream),
-              "async upload candidate pairs");
-    CheckCuda(cudaEventRecord(slot.h2d_end, slot.stream),
-              "cudaEventRecord(h2d_end)");
-
+  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+    cudaStream_t compute_stream = cache.compute_streams[chunk_idx % 2];
+    CheckCuda(cudaStreamWaitEvent(compute_stream, cache.input_ready, 0),
+              "cudaStreamWaitEvent(input_ready)");
+    const size_t offset = chunk_idx * chunk_size;
+    const size_t count = std::min(chunk_size, candidate_pairs.size() - offset);
+    CheckCuda(cudaEventRecord(cache.kernel_start_events[chunk_idx], compute_stream),
+              "cudaEventRecord(kernel_start)");
     constexpr int kBlockSize = 256;
     const int blocks =
         static_cast<int>((count + kBlockSize - 1) / kBlockSize);
-    ComputeLocalGainKernel<<<blocks, kBlockSize, 0, slot.stream>>>(
-        slot.d_pairs, static_cast<int>(count), cache.d_offsets,
-        cache.d_row_rep_ids, cache.d_neighbors, cache.d_weights,
-        cache.d_neighbor_sizes, cache.d_row_sizes, cache.d_row_self_loops,
-        slot.d_results);
+    ComputeLocalGainKernel<<<blocks, kBlockSize, 0, compute_stream>>>(
+        d_pairs + offset, static_cast<int>(count), d_offsets, d_row_rep_ids,
+        d_neighbors, d_weights, d_neighbor_sizes, d_row_sizes,
+        d_row_self_loops, cache.d_results + offset);
     CheckCuda(cudaGetLastError(), "ComputeLocalGainKernel launch");
-    CheckCuda(cudaEventRecord(slot.kernel_end, slot.stream),
+    CheckCuda(cudaEventRecord(cache.kernel_end_events[chunk_idx], compute_stream),
               "cudaEventRecord(kernel_end)");
+    CheckCuda(cudaEventRecord(cache.compute_done[chunk_idx % 2], compute_stream),
+              "cudaEventRecord(compute_done)");
 
-    CheckCuda(cudaMemcpyAsync(slot.h_results, slot.d_results,
-                              sizeof(DeviceLocalGainResult) * count,
-                              cudaMemcpyDeviceToHost, slot.stream),
-              "async download scoring results");
-    CheckCuda(cudaEventRecord(slot.d2h_end, slot.stream),
-              "cudaEventRecord(d2h_end)");
-
-    slot.in_flight = true;
     stats_.cuda_kernel_launches += 1;
-    stats_.cuda_h2d_bytes +=
-        static_cast<int64_t>(sizeof(int2) * count);
-    stats_.cuda_d2h_bytes +=
-        static_cast<int64_t>(sizeof(DeviceLocalGainResult) * count);
     stats_.cuda_max_candidates_per_launch =
         std::max<int64_t>(stats_.cuda_max_candidates_per_launch,
                           static_cast<int64_t>(count));
-
-    offset += count;
-    ++launch_index;
   }
 
-  for (CudaScoringCache::Slot& slot : cache.slots) {
-    collect_slot(slot);
+  if (num_chunks == 0) {
+    CheckCuda(cudaEventRecord(cache.compute_done[0], cache.transfer_stream),
+              "cudaEventRecord(empty_compute_done0)");
+    CheckCuda(cudaEventRecord(cache.compute_done[1], cache.transfer_stream),
+              "cudaEventRecord(empty_compute_done1)");
+  }
+
+  CheckCuda(cudaStreamWaitEvent(cache.transfer_stream, cache.compute_done[0], 0),
+            "cudaStreamWaitEvent(compute_done0)");
+  CheckCuda(cudaStreamWaitEvent(cache.transfer_stream, cache.compute_done[1], 0),
+            "cudaStreamWaitEvent(compute_done1)");
+  CheckCuda(cudaEventRecord(cache.packed_d2h_start, cache.transfer_stream),
+            "cudaEventRecord(packed_d2h_start)");
+  CheckCuda(cudaMemcpyAsync(cache.h_results, cache.d_results,
+                            sizeof(DeviceLocalGainResult) * candidate_pairs.size(),
+                            cudaMemcpyDeviceToHost, cache.transfer_stream),
+            "cudaMemcpyAsync packed results");
+  CheckCuda(cudaEventRecord(cache.packed_d2h_end, cache.transfer_stream),
+            "cudaEventRecord(packed_d2h_end)");
+  CheckCuda(cudaEventRecord(cache.result_ready, cache.transfer_stream),
+            "cudaEventRecord(result_ready)");
+  CheckCuda(cudaEventSynchronize(cache.result_ready), "cudaEventSynchronize(result_ready)");
+
+  for (size_t i = 0; i < candidate_pairs.size(); ++i) {
+    results[i].gain = cache.h_results[i].gain;
+    results[i].before_cost = cache.h_results[i].before_cost;
+  }
+
+  float packed_h2d_ms = 0.0f;
+  float packed_d2h_ms = 0.0f;
+  CheckCuda(cudaEventElapsedTime(&packed_h2d_ms, cache.packed_h2d_start,
+                                 cache.packed_h2d_end),
+            "cudaEventElapsedTime(packed_h2d)");
+  CheckCuda(cudaEventElapsedTime(&packed_d2h_ms, cache.packed_d2h_start,
+                                 cache.packed_d2h_end),
+            "cudaEventElapsedTime(packed_d2h)");
+  stats_.cuda_packed_h2d_ms += static_cast<double>(packed_h2d_ms);
+  stats_.cuda_packed_d2h_ms += static_cast<double>(packed_d2h_ms);
+  stats_.cuda_h2d_ms += static_cast<double>(packed_h2d_ms);
+  stats_.cuda_d2h_ms += static_cast<double>(packed_d2h_ms);
+  stats_.cuda_packed_h2d_calls += 1;
+  stats_.cuda_packed_d2h_calls += 1;
+  stats_.cuda_packed_input_bytes += static_cast<int64_t>(layout.total_bytes);
+  stats_.cuda_packed_output_bytes +=
+      static_cast<int64_t>(sizeof(DeviceLocalGainResult) * candidate_pairs.size());
+  stats_.cuda_h2d_bytes += static_cast<int64_t>(layout.total_bytes);
+  stats_.cuda_d2h_bytes +=
+      static_cast<int64_t>(sizeof(DeviceLocalGainResult) * candidate_pairs.size());
+  stats_.cuda_row_uploads += 1;
+
+  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+    float kernel_ms = 0.0f;
+    CheckCuda(cudaEventElapsedTime(&kernel_ms, cache.kernel_start_events[chunk_idx],
+                                   cache.kernel_end_events[chunk_idx]),
+              "cudaEventElapsedTime(kernel)");
+    stats_.cuda_kernel_ms += static_cast<double>(kernel_ms);
   }
 
   VerifyCudaResultsIfEnabled(candidate_pairs, flat_agg, results, chunk_size,
