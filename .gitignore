@@ -1,0 +1,14 @@
+logs/
+build/
+out/
+results/
+tests/
+tools/
+
+.venv/
+venv/
+
+.vscode
+.codex
+.agents
+
