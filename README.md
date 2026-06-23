@@ -158,8 +158,13 @@ number, so final groups remain reproducible and do not exceed the cap.
 
 - `--candidate-batch-budget <int>`
   仅对 `batch-ea-blocked + --scoring-backend cuda` 有效。默认 `0`。
-  该参数只控制 CUDA exact-gain scoring 中 candidate pairs 的 chunk 大小。
-  它不会再因为 candidate 分块而重复上传同一个 blocked slice 的 FlatAggCSR。
+  该参数只控制 CUDA exact-gain scoring 中 kernel chunk 的 candidate 数。
+  它不再参与 blocked prepare groups 或高层 scoring slice 的切分。
+
+- `--cuda-slice-memory-mb <int>`
+  仅对 `batch-ea-blocked + --scoring-backend cuda` 有效。默认 `0`。
+  `0` 表示自动模式；程序在 CUDA 初始化时只查询一次可用显存，并缓存一个保守 slice 预算。
+  `>0` 表示每个 blocked scoring slice 允许使用的最大估算 CUDA 内存 MiB。
 
 - `--overflow-group-gmax <int>`
   大 group 的局部细化阈值。默认 `0`，表示关闭。
@@ -227,26 +232,46 @@ number, so final groups remain reproducible and do not exceed the cap.
 
 - `--scoring-backend cuda`
   使用 CUDA scoring backend；当前主线 CUDA scoring 说明和 candidate batch 预算控制以 `batch-ea-blocked` 路径为准。若当前构建未启用真实 CUDA backend，则会报错或回退到 stub 能力边界。
-  当前 blocked CUDA V1 会为每个 scoring slice 构造一个 combined `FlatAggCSR`，
-  将 row arrays 上传一次并在 GPU 驻留，然后把 candidates 按 `--candidate-batch-budget`
-  切成多个 chunk，用两个 non-blocking streams 做
-  `H2D pairs -> kernel -> D2H results` 双缓冲流水。
+  当前 blocked CUDA 路径会先为一个 blocked scoring slice 构造 combined `FlatAggCSR`，
+  再把 candidates 按 `--candidate-batch-budget` 切成多个 kernel chunk。
+  V2 Commit 1 已经把 slice 规划从固定 `row_budget/nnz_budget`
+  改成按整块估算的自适应内存预算，并保持 slice 只能在完整 group 边界切分。
 
 - `--verify-cuda-gain`
   调试检查开关，只增加校验，不改变最终压缩结果。
 
 CUDA metrics 说明：
 
+- `merge_prepare_wall_ms`
+  blocked prepare 的墙钟时间。由于 block 内 group prepare 可以并行，它通常小于 task_sum。
+- `merge_prepare_task_sum_ms`
+  各个 prepare task 时间的确定性累加和；并行时可能大于 wall time。
 - `cuda_row_h2d_ms`
-  resident CSR 上传时间。
+  resident CSR 上传时间。当前语义保留，用于兼容 V1 指标。
 - `cuda_pair_h2d_ms`
-  candidate pair chunk 的 H2D 时间。
+  candidate pair chunk 的 H2D 时间。当前语义保留，用于兼容 V1 指标。
 - `cuda_kernel_ms`
   candidate chunk kernel 时间。
 - `cuda_d2h_ms`
-  candidate chunk result 的 D2H 时间。
+  candidate chunk result 的 D2H 时间。当前语义保留，用于兼容 V1 指标。
 - `cuda_total_ms`
   每次高层 `ScoreCandidatesCuda()` 调用的墙钟时间总和。
+- `cuda_init_ms`
+  CUDA cache/context 初始化开销。
+- `cuda_slice_count`
+  blocked CUDA 路径实际形成的 scoring slice 数。
+- `cuda_blocks_single_slice`
+  整个 block 可以作为单个 slice 提交的次数。
+- `cuda_blocks_multi_slice`
+  整个 block 需要拆成多个 slice 的次数。
+- `cuda_max_slice_rows`
+  观测到的单个 slice 最大 row 数。
+- `cuda_max_slice_nnz`
+  观测到的单个 slice 最大 nnz 数。
+- `cuda_max_slice_candidates`
+  观测到的单个 slice 最大 candidate 数。
+- `cuda_slice_memory_budget_bytes`
+  当前运行中用于 blocked CUDA 自适应 slice 的预算字节数。
 - `cuda_row_uploads`
   resident CSR 上传次数。
 - `cuda_kernel_launches`

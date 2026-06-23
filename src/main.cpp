@@ -19,6 +19,7 @@ struct CliOptions {
   int top_k = 16;
   int group_batch_size = 64;
   int candidate_batch_budget = 0;
+  int cuda_slice_memory_mb = 0;
   int overflow_group_gmax = 0;
   int overflow_refine_rounds = 0;
   bool ea_use_threshold = false;
@@ -61,6 +62,7 @@ static void PrintUsage() {
       << "  --top-k <int>           Top-k EA-proxy candidates per supernode for batch-ea modes\n"
       << "  --group-batch-size <int> Block size for batch-ea-blocked\n"
       << "  --candidate-batch-budget <int> Candidate budget per CUDA blocked batch\n"
+      << "  --cuda-slice-memory-mb <int> Max estimated CUDA memory per blocked slice in MiB (0=auto)\n"
       << "  --overflow-group-gmax <int> Max group size before local refinement (0 disables)\n"
       << "  --overflow-refine-rounds <int> Max local refinement rounds for overflow groups\n"
       << "  --ea-use-threshold      Enable local gain ratio threshold for batch-ea modes\n"
@@ -210,6 +212,8 @@ static CliOptions ParseArgs(int argc, char** argv) {
       opts.group_batch_size = std::stoi(argv[++i]);
     } else if (arg == "--candidate-batch-budget" && i + 1 < argc) {
       opts.candidate_batch_budget = std::stoi(argv[++i]);
+    } else if (arg == "--cuda-slice-memory-mb" && i + 1 < argc) {
+      opts.cuda_slice_memory_mb = std::stoi(argv[++i]);
     } else if (arg == "--overflow-group-gmax" && i + 1 < argc) {
       opts.overflow_group_gmax = std::stoi(argv[++i]);
     } else if (arg == "--overflow-refine-rounds" && i + 1 < argc) {
@@ -324,6 +328,7 @@ int main(int argc, char** argv) {
     Sweg sweg(graph, opts.merge_mode, opts.top_k, opts.ea_use_threshold,
               opts.seed, opts.scoring_backend, opts.verify_cuda_gain,
               opts.group_batch_size, opts.candidate_batch_budget,
+              opts.cuda_slice_memory_mb,
               opts.overflow_group_gmax, opts.overflow_refine_rounds,
               opts.divide_hash_dims, opts.divide_max_group, threshold_config);
     sweg.Run(opts.iterations, opts.print_offset);
@@ -385,6 +390,8 @@ int main(int argc, char** argv) {
     PrintMetric("group_batch_size", std::to_string(opts.group_batch_size));
     PrintMetric("candidate_batch_budget",
                 std::to_string(opts.candidate_batch_budget));
+    PrintMetric("cuda_slice_memory_mb",
+                std::to_string(opts.cuda_slice_memory_mb));
     PrintMetric("overflow_group_gmax",
                 std::to_string(opts.overflow_group_gmax));
     PrintMetric("overflow_refine_rounds",
@@ -409,6 +416,10 @@ int main(int argc, char** argv) {
     PrintMetric("runtime_output_ms", FormatDouble(stats.runtime_output_ms));
     PrintMetric("runtime_algorithm_ms", FormatDouble(runtime_algorithm_ms));
     PrintMetric("runtime_end_to_end_ms", FormatDouble(runtime_end_to_end_ms));
+    PrintMetric("merge_prepare_wall_ms",
+                FormatDouble(stats.merge_prepare_wall_ms));
+    PrintMetric("merge_prepare_task_sum_ms",
+                FormatDouble(stats.merge_prepare_task_sum_ms));
     PrintMetric("merge_create_w_ms", FormatDouble(stats.merge_create_w_ms));
     PrintMetric("merge_scoring_ms", FormatDouble(stats.merge_scoring_ms));
     PrintMetric("merge_candidate_gen_ms",
@@ -464,12 +475,17 @@ int main(int argc, char** argv) {
                 FormatDouble(stats.threshold_acceptance_rate_last));
     PrintMetric("threshold_sample_count_last",
                 std::to_string(stats.threshold_sample_count_last));
+    PrintMetric("cuda_init_ms", FormatDouble(stats.cuda_init_ms));
     PrintMetric("cuda_h2d_ms", FormatDouble(stats.cuda_h2d_ms));
     PrintMetric("cuda_row_h2d_ms", FormatDouble(stats.cuda_row_h2d_ms));
     PrintMetric("cuda_pair_h2d_ms", FormatDouble(stats.cuda_pair_h2d_ms));
     PrintMetric("cuda_kernel_ms", FormatDouble(stats.cuda_kernel_ms));
     PrintMetric("cuda_d2h_ms", FormatDouble(stats.cuda_d2h_ms));
     PrintMetric("cuda_total_ms", FormatDouble(stats.cuda_total_ms));
+    PrintMetric("cuda_packed_h2d_ms",
+                FormatDouble(stats.cuda_packed_h2d_ms));
+    PrintMetric("cuda_packed_d2h_ms",
+                FormatDouble(stats.cuda_packed_d2h_ms));
     PrintMetric("cuda_num_calls", std::to_string(stats.cuda_num_calls));
     PrintMetric("cuda_row_uploads", std::to_string(stats.cuda_row_uploads));
     PrintMetric("cuda_kernel_launches",
@@ -478,6 +494,28 @@ int main(int argc, char** argv) {
     PrintMetric("cuda_d2h_bytes", std::to_string(stats.cuda_d2h_bytes));
     PrintMetric("cuda_max_candidates_per_launch",
                 std::to_string(stats.cuda_max_candidates_per_launch));
+    PrintMetric("cuda_packed_h2d_calls",
+                std::to_string(stats.cuda_packed_h2d_calls));
+    PrintMetric("cuda_packed_d2h_calls",
+                std::to_string(stats.cuda_packed_d2h_calls));
+    PrintMetric("cuda_packed_input_bytes",
+                std::to_string(stats.cuda_packed_input_bytes));
+    PrintMetric("cuda_packed_output_bytes",
+                std::to_string(stats.cuda_packed_output_bytes));
+    PrintMetric("cuda_slice_count",
+                std::to_string(stats.cuda_slice_count));
+    PrintMetric("cuda_blocks_single_slice",
+                std::to_string(stats.cuda_blocks_single_slice));
+    PrintMetric("cuda_blocks_multi_slice",
+                std::to_string(stats.cuda_blocks_multi_slice));
+    PrintMetric("cuda_max_slice_rows",
+                std::to_string(stats.cuda_max_slice_rows));
+    PrintMetric("cuda_max_slice_nnz",
+                std::to_string(stats.cuda_max_slice_nnz));
+    PrintMetric("cuda_max_slice_candidates",
+                std::to_string(stats.cuda_max_slice_candidates));
+    PrintMetric("cuda_slice_memory_budget_bytes",
+                std::to_string(stats.cuda_slice_memory_budget_bytes));
     PrintMetric("overflow_groups_seen",
                 std::to_string(stats.overflow_groups_seen));
     PrintMetric("overflow_refined_subgroups",
@@ -515,6 +553,7 @@ int main(int argc, char** argv) {
           "top_k",
           "group_batch_size",
           "candidate_batch_budget",
+          "cuda_slice_memory_mb",
           "overflow_group_gmax",
           "overflow_refine_rounds",
           "error_bound",
@@ -535,6 +574,8 @@ int main(int argc, char** argv) {
           "runtime_output_ms",
           "runtime_algorithm_ms",
           "runtime_end_to_end_ms",
+          "merge_prepare_wall_ms",
+          "merge_prepare_task_sum_ms",
           "merge_create_w_ms",
           "merge_scoring_ms",
           "merge_candidate_gen_ms",
@@ -561,18 +602,32 @@ int main(int argc, char** argv) {
           "threshold_acceptance_scale",
           "threshold_acceptance_rate_last",
           "threshold_sample_count_last",
+          "cuda_init_ms",
           "cuda_h2d_ms",
           "cuda_row_h2d_ms",
           "cuda_pair_h2d_ms",
           "cuda_kernel_ms",
           "cuda_d2h_ms",
           "cuda_total_ms",
+          "cuda_packed_h2d_ms",
+          "cuda_packed_d2h_ms",
           "cuda_num_calls",
           "cuda_row_uploads",
           "cuda_kernel_launches",
           "cuda_h2d_bytes",
           "cuda_d2h_bytes",
           "cuda_max_candidates_per_launch",
+          "cuda_packed_h2d_calls",
+          "cuda_packed_d2h_calls",
+          "cuda_packed_input_bytes",
+          "cuda_packed_output_bytes",
+          "cuda_slice_count",
+          "cuda_blocks_single_slice",
+          "cuda_blocks_multi_slice",
+          "cuda_max_slice_rows",
+          "cuda_max_slice_nnz",
+          "cuda_max_slice_candidates",
+          "cuda_slice_memory_budget_bytes",
           "overflow_groups_seen",
           "overflow_refined_subgroups",
           "overflow_forced_chunks",
@@ -601,6 +656,7 @@ int main(int argc, char** argv) {
           std::to_string(opts.top_k),
           std::to_string(opts.group_batch_size),
           std::to_string(opts.candidate_batch_budget),
+          std::to_string(opts.cuda_slice_memory_mb),
           std::to_string(opts.overflow_group_gmax),
           std::to_string(opts.overflow_refine_rounds),
           FormatDouble(opts.error_bound),
@@ -621,6 +677,8 @@ int main(int argc, char** argv) {
           FormatDouble(stats.runtime_output_ms),
           FormatDouble(runtime_algorithm_ms),
           FormatDouble(runtime_end_to_end_ms),
+          FormatDouble(stats.merge_prepare_wall_ms),
+          FormatDouble(stats.merge_prepare_task_sum_ms),
           FormatDouble(stats.merge_create_w_ms),
           FormatDouble(stats.merge_scoring_ms),
           FormatDouble(stats.merge_candidate_gen_ms),
@@ -647,18 +705,32 @@ int main(int argc, char** argv) {
           FormatDouble(stats.threshold_acceptance_scale),
           FormatDouble(stats.threshold_acceptance_rate_last),
           std::to_string(stats.threshold_sample_count_last),
+          FormatDouble(stats.cuda_init_ms),
           FormatDouble(stats.cuda_h2d_ms),
           FormatDouble(stats.cuda_row_h2d_ms),
           FormatDouble(stats.cuda_pair_h2d_ms),
           FormatDouble(stats.cuda_kernel_ms),
           FormatDouble(stats.cuda_d2h_ms),
           FormatDouble(stats.cuda_total_ms),
+          FormatDouble(stats.cuda_packed_h2d_ms),
+          FormatDouble(stats.cuda_packed_d2h_ms),
           std::to_string(stats.cuda_num_calls),
           std::to_string(stats.cuda_row_uploads),
           std::to_string(stats.cuda_kernel_launches),
           std::to_string(stats.cuda_h2d_bytes),
           std::to_string(stats.cuda_d2h_bytes),
           std::to_string(stats.cuda_max_candidates_per_launch),
+          std::to_string(stats.cuda_packed_h2d_calls),
+          std::to_string(stats.cuda_packed_d2h_calls),
+          std::to_string(stats.cuda_packed_input_bytes),
+          std::to_string(stats.cuda_packed_output_bytes),
+          std::to_string(stats.cuda_slice_count),
+          std::to_string(stats.cuda_blocks_single_slice),
+          std::to_string(stats.cuda_blocks_multi_slice),
+          std::to_string(stats.cuda_max_slice_rows),
+          std::to_string(stats.cuda_max_slice_nnz),
+          std::to_string(stats.cuda_max_slice_candidates),
+          std::to_string(stats.cuda_slice_memory_budget_bytes),
           std::to_string(stats.overflow_groups_seen),
           std::to_string(stats.overflow_refined_subgroups),
           std::to_string(stats.overflow_forced_chunks),

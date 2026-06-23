@@ -45,6 +45,14 @@ double SafeRatio(uint64_t numerator, uint64_t denominator) {
              : 0.0;
 }
 
+size_t AlignUp(size_t value, size_t alignment) {
+  if (alignment <= 1) {
+    return value;
+  }
+  const size_t remainder = value % alignment;
+  return remainder == 0 ? value : (value + alignment - remainder);
+}
+
 }  // namespace
 
 const char* MergeModeToString(MergeMode mode) {
@@ -83,6 +91,7 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
            bool ea_use_threshold, uint64_t seed,
            ScoringBackend scoring_backend, bool verify_cuda_gain,
            int group_batch_size, int candidate_batch_budget,
+           int cuda_slice_memory_mb,
            int overflow_group_gmax, int overflow_refine_rounds,
            int divide_hash_dims, int divide_max_group,
            const ThresholdConfig& threshold_config)
@@ -95,6 +104,7 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
       verify_cuda_gain_(verify_cuda_gain),
       group_batch_size_(std::max(1, group_batch_size)),
       candidate_batch_budget_(std::max(0, candidate_batch_budget)),
+      cuda_slice_memory_mb_(std::max(0, cuda_slice_memory_mb)),
       overflow_group_gmax_(std::max(0, overflow_group_gmax)),
       overflow_refine_rounds_(std::max(0, overflow_refine_rounds)),
       divide_hash_dims_(divide_hash_dims > 0 ? divide_hash_dims : 16),
@@ -288,22 +298,45 @@ void Sweg::ResetParallelScratch(ParallelScratch& scratch) const {
   scratch.touched.clear();
 }
 
-void Sweg::EnsureParallelWorkspaces(int thread_count) const {
+void Sweg::EnsurePrepareWorkspace(PrepareWorkspace* workspace) const {
+  if (workspace == nullptr) {
+    return;
+  }
+  if (workspace->scratch.counts.size() == static_cast<size_t>(n_)) {
+    return;
+  }
+  workspace->scratch.counts.assign(static_cast<size_t>(n_), 0);
+  workspace->scratch.marks.assign(static_cast<size_t>(n_), 0);
+  workspace->scratch.touched.reserve(static_cast<size_t>(std::min(n_, 1 << 20)));
+  workspace->scratch.epoch = 1;
+}
+
+void Sweg::EnsurePrepareWorkspaces(int thread_count) const {
   if (thread_count <= 0) {
     thread_count = 1;
   }
-  if (static_cast<int>(parallel_workspaces_.size()) >= thread_count) {
+  if (static_cast<int>(prepare_workspaces_.size()) >= thread_count) {
     return;
   }
-  const size_t old_size = parallel_workspaces_.size();
-  parallel_workspaces_.resize(static_cast<size_t>(thread_count));
-  for (size_t i = old_size; i < parallel_workspaces_.size(); ++i) {
-    auto& ws = parallel_workspaces_[i];
-    ws.counts.assign(static_cast<size_t>(n_), 0);
-    ws.marks.assign(static_cast<size_t>(n_), 0);
-    ws.touched.reserve(static_cast<size_t>(std::min(n_, 1 << 20)));
-    ws.epoch = 1;
+  const size_t old_size = prepare_workspaces_.size();
+  prepare_workspaces_.resize(static_cast<size_t>(thread_count));
+  for (size_t i = old_size; i < prepare_workspaces_.size(); ++i) {
+    EnsurePrepareWorkspace(&prepare_workspaces_[i]);
   }
+}
+
+void Sweg::AccumulatePrepareStats(const EaPrepareStats& prepare_stats) {
+  stats_.merge_prepare_task_sum_ms += prepare_stats.wall_ms;
+  stats_.merge_create_w_ms += prepare_stats.create_w_ms;
+  stats_.merge_candidate_gen_ms += prepare_stats.candidate_gen_ms;
+  stats_.merge_scoring_ms += prepare_stats.candidate_gen_ms;
+  stats_.merge_group_count += prepare_stats.group_count;
+  stats_.merge_group_max_size =
+      std::max<uint64_t>(stats_.merge_group_max_size,
+                         prepare_stats.group_max_size);
+  stats_.merge_raw_pair_count += prepare_stats.raw_pair_count;
+  stats_.merge_candidate_pairs_after_prune +=
+      prepare_stats.candidate_pairs_after_prune;
 }
 
 void Sweg::Run(int iterations, int print_offset) {
@@ -532,7 +565,6 @@ Sweg::SparseCounts Sweg::CreateWForSupernode(int rep,
 Sweg::SparseCounts Sweg::CreateWForSupernodeWithScratch(
     int rep, ParallelScratch& scratch, int64_t* self_loop_count) const {
   ResetParallelScratch(scratch);
-  ResetScratch();
   int64_t loop_count = 0;
 
   for (int node = I_[rep]; node != -1; node = J_[node]) {
@@ -589,91 +621,101 @@ void Sweg::Merge(int iter, int total_iterations) {
 
   if (merge_mode_ == MergeMode::kBatchEncodingAwareBlocked) {
     const int block_size = std::max(1, group_batch_size_);
-    int64_t blocked_slice_count = 0;
-    int64_t blocked_slice_max_candidates = 0;
-    int64_t blocked_slice_max_rows = 0;
-    int64_t blocked_slice_max_nnz = 0;
+    const size_t candidate_chunk_size =
+        candidate_batch_budget_ > 0
+            ? static_cast<size_t>(candidate_batch_budget_)
+            : 0;
     for (size_t block_start = 0; block_start < groups.size();
          block_start += static_cast<size_t>(block_size)) {
       const size_t block_end =
           std::min(groups.size(), block_start + static_cast<size_t>(block_size));
       std::vector<std::pair<int, int>> block_selected_pairs;
-
-      std::vector<EaGroupPrepared> prepared_slice;
-      prepared_slice.reserve(block_end - block_start);
-      size_t slice_candidate_count = 0;
-      size_t slice_rows = 0;
-      size_t slice_nnz = 0;
-      const size_t row_budget = 65536;
-      const size_t nnz_budget = 2000000;
-
-      auto flush_prepared_slice = [&]() {
-        if (prepared_slice.empty()) {
-          return;
-        }
-        blocked_slice_count += 1;
-        blocked_slice_max_candidates =
-            std::max<int64_t>(blocked_slice_max_candidates,
-                              static_cast<int64_t>(slice_candidate_count));
-        blocked_slice_max_rows =
-            std::max<int64_t>(blocked_slice_max_rows,
-                              static_cast<int64_t>(slice_rows));
-        blocked_slice_max_nnz =
-            std::max<int64_t>(blocked_slice_max_nnz,
-                              static_cast<int64_t>(slice_nnz));
-
-        if (scoring_backend_ == ScoringBackend::kCuda) {
-          ScoreBatchEncodingAwarePreparedGroupsBlocked(&prepared_slice,
-                                                       threshold);
-        } else {
-          for (EaGroupPrepared& prepared : prepared_slice) {
-            ScoreBatchEncodingAwarePreparedGroup(&prepared, threshold);
-          }
-        }
-
-        for (const EaGroupPrepared& prepared : prepared_slice) {
-          std::vector<std::pair<int, int>> group_pairs =
-              SelectScoredBatchEncodingAwareGroupPairs(prepared);
-          block_selected_pairs.insert(block_selected_pairs.end(),
-                                      group_pairs.begin(), group_pairs.end());
-        }
-        prepared_slice.clear();
-        slice_candidate_count = 0;
-        slice_rows = 0;
-        slice_nnz = 0;
-      };
-
+      std::vector<std::vector<int>> work_items;
+      work_items.reserve((block_end - block_start) * 2);
       for (size_t gi = block_start; gi < block_end; ++gi) {
         const GroupSpan& group = groups[gi];
         const auto refined_groups = build_refined_group_list(group);
         for (const auto& q : refined_groups) {
-          EaGroupPrepared prepared = PrepareBatchEncodingAwareGroup(q);
-          size_t prepared_nnz = 0;
-          for (const SparseCounts& row : prepared.agg_by_idx) {
-            prepared_nnz += row.size();
-          }
-          const size_t prepared_rows = prepared.q.size();
-          const size_t prepared_candidates = prepared.candidate_pairs.size();
-
-          const bool would_exceed_budget =
-              !prepared_slice.empty() &&
-              (slice_rows + prepared_rows > row_budget ||
-               slice_nnz + prepared_nnz > nnz_budget);
-          if (would_exceed_budget) {
-            flush_prepared_slice();
-          }
-
-          slice_candidate_count += prepared_candidates;
-          slice_rows += prepared_rows;
-          slice_nnz += prepared_nnz;
-          prepared_slice.push_back(std::move(prepared));
-
-          if (slice_rows >= row_budget || slice_nnz >= nnz_budget) {
-            flush_prepared_slice();
-          }
+          work_items.push_back(q);
         }
       }
-      flush_prepared_slice();
+
+      std::vector<EaGroupPrepared> prepared_groups(work_items.size());
+      std::vector<EaPrepareStats> prepare_stats(work_items.size());
+      if (!work_items.empty()) {
+        const auto prepare_start = std::chrono::steady_clock::now();
+#ifdef _OPENMP
+        const int thread_count = std::max(1, omp_get_max_threads());
+        EnsurePrepareWorkspaces(thread_count);
+#pragma omp parallel for schedule(dynamic, 1) if(work_items.size() > 1)
+        for (int i = 0; i < static_cast<int>(work_items.size()); ++i) {
+          PrepareWorkspace* workspace = nullptr;
+#ifdef _OPENMP
+          workspace = &prepare_workspaces_[static_cast<size_t>(omp_get_thread_num())];
+#else
+          workspace = &prepare_workspaces_[0];
+#endif
+          EaPrepareResult result = PrepareBatchEncodingAwareGroupWithWorkspace(
+              work_items[static_cast<size_t>(i)], workspace, false);
+          prepared_groups[static_cast<size_t>(i)] = std::move(result.prepared);
+          prepare_stats[static_cast<size_t>(i)] = result.stats;
+        }
+#else
+        EnsurePrepareWorkspaces(1);
+        for (size_t i = 0; i < work_items.size(); ++i) {
+          EaPrepareResult result = PrepareBatchEncodingAwareGroupWithWorkspace(
+              work_items[i], &prepare_workspaces_[0], false);
+          prepared_groups[i] = std::move(result.prepared);
+          prepare_stats[i] = result.stats;
+        }
+#endif
+        stats_.merge_prepare_wall_ms +=
+            ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+      }
+
+      for (size_t i = 0; i < prepare_stats.size(); ++i) {
+        AccumulatePrepareStats(prepare_stats[i]);
+      }
+
+      std::vector<CudaSliceSpan> slice_plan;
+      if (scoring_backend_ == ScoringBackend::kCuda) {
+        slice_plan = BuildCudaSlicePlan(prepared_groups, candidate_chunk_size);
+        stats_.cuda_slice_count += static_cast<int64_t>(slice_plan.size());
+        if (slice_plan.size() <= 1) {
+          stats_.cuda_blocks_single_slice += 1;
+        } else {
+          stats_.cuda_blocks_multi_slice += 1;
+        }
+        for (const CudaSliceSpan& slice : slice_plan) {
+          stats_.cuda_max_slice_rows =
+              std::max<int64_t>(stats_.cuda_max_slice_rows,
+                                static_cast<int64_t>(slice.rows));
+          stats_.cuda_max_slice_nnz =
+              std::max<int64_t>(stats_.cuda_max_slice_nnz,
+                                static_cast<int64_t>(slice.nnz));
+          stats_.cuda_max_slice_candidates =
+              std::max<int64_t>(stats_.cuda_max_slice_candidates,
+                                static_cast<int64_t>(slice.candidates));
+        }
+      }
+
+      if (scoring_backend_ == ScoringBackend::kCuda) {
+        for (const CudaSliceSpan& slice : slice_plan) {
+          ScoreBatchEncodingAwarePreparedGroupsBlockedRange(
+              &prepared_groups, slice.begin, slice.end, threshold);
+        }
+      } else {
+        for (EaGroupPrepared& prepared : prepared_groups) {
+          ScoreBatchEncodingAwarePreparedGroup(&prepared, threshold);
+        }
+      }
+
+      for (const EaGroupPrepared& prepared : prepared_groups) {
+        std::vector<std::pair<int, int>> group_pairs =
+            SelectScoredBatchEncodingAwareGroupPairs(prepared);
+        block_selected_pairs.insert(block_selected_pairs.end(),
+                                    group_pairs.begin(), group_pairs.end());
+      }
 
       const auto update_start = std::chrono::steady_clock::now();
       for (const auto& pair : block_selected_pairs) {
@@ -706,11 +748,11 @@ void Sweg::Merge(int iter, int total_iterations) {
           std::max(stats_.overflow_max_group_after,
                    overflow_counters.max_group_after);
     }
-    if (blocked_slice_count > 0) {
-      std::cout << "  Blocked scoring slices: count=" << blocked_slice_count
-                << " max_candidates=" << blocked_slice_max_candidates
-                << " max_rows=" << blocked_slice_max_rows
-                << " max_nnz=" << blocked_slice_max_nnz << "\n";
+    if (stats_.cuda_slice_count > 0 && scoring_backend_ == ScoringBackend::kCuda) {
+      std::cout << "  Blocked scoring slices: count=" << stats_.cuda_slice_count
+                << " max_candidates=" << stats_.cuda_max_slice_candidates
+                << " max_rows=" << stats_.cuda_max_slice_rows
+                << " max_nnz=" << stats_.cuda_max_slice_nnz << "\n";
     }
     EndMergeIteration();
     return;
@@ -774,6 +816,133 @@ Sweg::SparseCounts Sweg::AggregateWBySupernodeWithScratch(
   std::sort(aggregated.begin(), aggregated.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
   return aggregated;
+}
+
+size_t Sweg::EstimateCudaSliceBytes(size_t total_rows, size_t total_nnz,
+                                    size_t total_candidates,
+                                    size_t candidate_chunk_size) const {
+  using PackedPair = std::pair<int, int>;
+  const size_t offsets_bytes =
+      AlignUp(sizeof(int) * (total_rows + 1), alignof(int));
+  const size_t row_rep_ids_bytes =
+      AlignUp(sizeof(int) * total_rows, alignof(int));
+  const size_t neighbors_bytes =
+      AlignUp(sizeof(int) * total_nnz, alignof(int));
+  const size_t weights_bytes =
+      AlignUp(sizeof(int64_t) * total_nnz, alignof(int64_t));
+  const size_t neighbor_sizes_bytes =
+      AlignUp(sizeof(int64_t) * total_nnz, alignof(int64_t));
+  const size_t row_sizes_bytes =
+      AlignUp(sizeof(int64_t) * total_rows, alignof(int64_t));
+  const size_t row_self_loops_bytes =
+      AlignUp(sizeof(int64_t) * total_rows, alignof(int64_t));
+  const size_t pairs_bytes =
+      AlignUp(sizeof(PackedPair) * total_candidates, alignof(PackedPair));
+  const size_t output_bytes = AlignUp(
+      sizeof(LocalGainResult) * total_candidates, alignof(LocalGainResult));
+  const size_t max_chunk_candidates =
+      candidate_chunk_size == 0
+          ? total_candidates
+          : std::max<size_t>(1, std::min(candidate_chunk_size, total_candidates));
+  const size_t chunk_pair_bytes =
+      AlignUp(sizeof(PackedPair) * max_chunk_candidates, alignof(PackedPair));
+  const size_t chunk_result_bytes = AlignUp(
+      sizeof(LocalGainResult) * max_chunk_candidates, alignof(LocalGainResult));
+
+  const size_t resident_bytes =
+      offsets_bytes + row_rep_ids_bytes + neighbors_bytes + weights_bytes +
+      neighbor_sizes_bytes + row_sizes_bytes + row_self_loops_bytes;
+  const size_t host_input_bytes = resident_bytes + pairs_bytes;
+  const size_t device_input_bytes = resident_bytes + pairs_bytes;
+  const size_t stream_bytes = (chunk_pair_bytes + chunk_result_bytes) * 2;
+  const size_t io_bytes = output_bytes * 2;
+  const size_t staging_overhead = AlignUp(64 * 1024, 256);
+
+  return host_input_bytes + device_input_bytes + io_bytes + stream_bytes +
+         staging_overhead;
+}
+
+std::vector<Sweg::CudaSliceSpan> Sweg::BuildCudaSlicePlan(
+    const std::vector<EaGroupPrepared>& prepared_groups,
+    size_t candidate_chunk_size) {
+  std::vector<CudaSliceSpan> slices;
+  if (prepared_groups.empty()) {
+    return slices;
+  }
+
+  size_t total_rows = 0;
+  size_t total_nnz = 0;
+  size_t total_candidates = 0;
+  std::vector<size_t> group_rows(prepared_groups.size(), 0);
+  std::vector<size_t> group_nnz(prepared_groups.size(), 0);
+  std::vector<size_t> group_candidates(prepared_groups.size(), 0);
+  for (size_t i = 0; i < prepared_groups.size(); ++i) {
+    const EaGroupPrepared& group = prepared_groups[i];
+    group_rows[i] = group.q.size();
+    group_candidates[i] = group.candidate_pairs.size();
+    for (const SparseCounts& row : group.agg_by_idx) {
+      group_nnz[i] += row.size();
+    }
+    total_rows += group_rows[i];
+    total_nnz += group_nnz[i];
+    total_candidates += group_candidates[i];
+  }
+
+  const size_t budget_bytes = GetCudaSliceMemoryBudgetBytes();
+  stats_.cuda_slice_memory_budget_bytes =
+      static_cast<int64_t>(budget_bytes);
+  if (budget_bytes == 0 ||
+      EstimateCudaSliceBytes(total_rows, total_nnz, total_candidates,
+                             candidate_chunk_size) <= budget_bytes) {
+    slices.push_back(CudaSliceSpan{0, prepared_groups.size(), total_rows,
+                                   total_nnz, total_candidates,
+                                   EstimateCudaSliceBytes(
+                                       total_rows, total_nnz, total_candidates,
+                                       candidate_chunk_size)});
+    return slices;
+  }
+
+  size_t begin = 0;
+  while (begin < prepared_groups.size()) {
+    size_t end = begin;
+    size_t slice_rows = 0;
+    size_t slice_nnz = 0;
+    size_t slice_candidates = 0;
+    while (end < prepared_groups.size()) {
+      const size_t next_rows = slice_rows + group_rows[end];
+      const size_t next_nnz = slice_nnz + group_nnz[end];
+      const size_t next_candidates = slice_candidates + group_candidates[end];
+      const size_t estimated =
+          EstimateCudaSliceBytes(next_rows, next_nnz, next_candidates,
+                                 candidate_chunk_size);
+      if (end > begin && estimated > budget_bytes) {
+        break;
+      }
+      slice_rows = next_rows;
+      slice_nnz = next_nnz;
+      slice_candidates = next_candidates;
+      ++end;
+      if (estimated > budget_bytes) {
+        break;
+      }
+    }
+    if (end == begin) {
+      ++end;
+      slice_rows = group_rows[begin];
+      slice_nnz = group_nnz[begin];
+      slice_candidates = group_candidates[begin];
+    }
+    slices.push_back(CudaSliceSpan{
+        begin,
+        end,
+        slice_rows,
+        slice_nnz,
+        slice_candidates,
+        EstimateCudaSliceBytes(slice_rows, slice_nnz, slice_candidates,
+                               candidate_chunk_size)});
+    begin = end;
+  }
+  return slices;
 }
 
 int64_t Sweg::EdgeCountToSupernode(const SparseCounts& aggregated, int target_rep,
@@ -893,69 +1062,85 @@ Sweg::LocalGainResult Sweg::ComputeLocalEncodingGain(const SparseCounts& agg_a,
 
 Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
     const std::vector<int>& q) {
-  EaGroupPrepared prepared;
-  prepared.q = q;
+  PrepareWorkspace workspace;
+  EaPrepareResult result = PrepareBatchEncodingAwareGroupWithWorkspace(
+      q, &workspace, true);
+  AccumulatePrepareStats(result.stats);
+  return std::move(result.prepared);
+}
 
-  const int group_size = static_cast<int>(prepared.q.size());
+Sweg::EaPrepareResult Sweg::PrepareBatchEncodingAwareGroupWithWorkspace(
+    const std::vector<int>& q, PrepareWorkspace* workspace,
+    bool allow_inner_parallel) {
+  EaPrepareResult result;
+  result.prepared.q = q;
+
+  const auto prepare_start = std::chrono::steady_clock::now();
+  EnsurePrepareWorkspace(workspace);
+
+  const int group_size = static_cast<int>(result.prepared.q.size());
   if (group_size < 2) {
-    return prepared;
+    result.stats.wall_ms =
+        ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+    return result;
   }
 
-  stats_.merge_group_count += 1;
-  stats_.merge_group_max_size =
-      std::max<uint64_t>(stats_.merge_group_max_size,
-                         static_cast<uint64_t>(group_size));
-  stats_.merge_raw_pair_count +=
+  result.stats.group_count = 1;
+  result.stats.group_max_size = static_cast<uint64_t>(group_size);
+  result.stats.raw_pair_count =
       static_cast<uint64_t>(group_size) *
       static_cast<uint64_t>(group_size - 1) / 2ULL;
 
   const int top_k = std::max(1, std::min(top_k_, group_size - 1));
   const auto create_w_start = std::chrono::steady_clock::now();
   std::vector<SparseCounts> w_by_idx(static_cast<size_t>(group_size));
-  prepared.agg_by_idx.resize(static_cast<size_t>(group_size));
-  prepared.self_loops_by_idx.assign(static_cast<size_t>(group_size), 0);
-  prepared.size_by_idx.assign(static_cast<size_t>(group_size), 0);
-  const bool use_parallel_create =
-      group_size >= 64;
+  result.prepared.agg_by_idx.resize(static_cast<size_t>(group_size));
+  result.prepared.self_loops_by_idx.assign(static_cast<size_t>(group_size), 0);
+  result.prepared.size_by_idx.assign(static_cast<size_t>(group_size), 0);
+  const bool use_parallel_create = allow_inner_parallel && group_size >= 64;
 #ifdef _OPENMP
   if (use_parallel_create) {
     const int thread_count = std::max(1, omp_get_max_threads());
-    EnsureParallelWorkspaces(thread_count);
+    EnsurePrepareWorkspaces(thread_count);
 #pragma omp parallel for schedule(dynamic, 8)
     for (int i = 0; i < group_size; ++i) {
-      const int rep = prepared.q[static_cast<size_t>(i)];
+      const int rep = result.prepared.q[static_cast<size_t>(i)];
       if (I_[rep] == -1) {
         continue;
       }
       const int tid = omp_get_thread_num();
-      auto& ws = parallel_workspaces_[static_cast<size_t>(tid)];
+      PrepareWorkspace& ws = prepare_workspaces_[static_cast<size_t>(tid)];
       w_by_idx[static_cast<size_t>(i)] =
           CreateWForSupernodeWithScratch(
-              rep, ws, &prepared.self_loops_by_idx[static_cast<size_t>(i)]);
-      prepared.agg_by_idx[static_cast<size_t>(i)] =
-          AggregateWBySupernodeWithScratch(w_by_idx[static_cast<size_t>(i)], ws);
-      prepared.size_by_idx[static_cast<size_t>(i)] = static_cast<int64_t>(
+              rep, ws.scratch,
+              &result.prepared.self_loops_by_idx[static_cast<size_t>(i)]);
+      result.prepared.agg_by_idx[static_cast<size_t>(i)] =
+          AggregateWBySupernodeWithScratch(w_by_idx[static_cast<size_t>(i)],
+                                           ws.scratch);
+      result.prepared.size_by_idx[static_cast<size_t>(i)] = static_cast<int64_t>(
           supernode_sizes_by_rep_[static_cast<size_t>(rep)]);
     }
   } else
 #endif
   {
     for (int i = 0; i < group_size; ++i) {
-      const int rep = prepared.q[static_cast<size_t>(i)];
+      const int rep = result.prepared.q[static_cast<size_t>(i)];
       if (I_[rep] != -1) {
         w_by_idx[static_cast<size_t>(i)] =
-            CreateWForSupernode(rep,
-                                &prepared.self_loops_by_idx[static_cast<size_t>(i)]);
-        prepared.agg_by_idx[static_cast<size_t>(i)] =
-            AggregateWBySupernode(w_by_idx[static_cast<size_t>(i)]);
-        prepared.size_by_idx[static_cast<size_t>(i)] =
+            CreateWForSupernodeWithScratch(
+                rep, workspace->scratch,
+                &result.prepared.self_loops_by_idx[static_cast<size_t>(i)]);
+        result.prepared.agg_by_idx[static_cast<size_t>(i)] =
+            AggregateWBySupernodeWithScratch(w_by_idx[static_cast<size_t>(i)],
+                                             workspace->scratch);
+        result.prepared.size_by_idx[static_cast<size_t>(i)] =
             static_cast<int64_t>(
                 supernode_sizes_by_rep_[static_cast<size_t>(rep)]);
       }
     }
   }
   const auto create_w_end = std::chrono::steady_clock::now();
-  stats_.merge_create_w_ms += ElapsedMs(create_w_start, create_w_end);
+  result.stats.create_w_ms = ElapsedMs(create_w_start, create_w_end);
 
   const auto candidate_gen_start = std::chrono::steady_clock::now();
   struct TargetEntry {
@@ -977,7 +1162,7 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
   std::unordered_map<int, int> row_index_by_rep;
   row_index_by_rep.reserve(static_cast<size_t>(group_size) * 2U + 1U);
   for (int i = 0; i < group_size; ++i) {
-    const int rep = prepared.q[static_cast<size_t>(i)];
+    const int rep = result.prepared.q[static_cast<size_t>(i)];
     if (I_[rep] == -1) {
       continue;
     }
@@ -988,14 +1173,14 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
   buckets_by_target.reserve(static_cast<size_t>(group_size) * 4U + 1U);
   std::vector<int64_t> approx_old_cost_by_idx(static_cast<size_t>(group_size), 0);
   for (int i = 0; i < group_size; ++i) {
-    const int rep_i = prepared.q[static_cast<size_t>(i)];
+    const int rep_i = result.prepared.q[static_cast<size_t>(i)];
     if (I_[rep_i] == -1) {
       continue;
     }
-    const int64_t size_i = prepared.size_by_idx[static_cast<size_t>(i)];
+    const int64_t size_i = result.prepared.size_by_idx[static_cast<size_t>(i)];
     const int64_t self_loops_i =
-        prepared.self_loops_by_idx[static_cast<size_t>(i)];
-    for (const auto& kv : prepared.agg_by_idx[static_cast<size_t>(i)]) {
+        result.prepared.self_loops_by_idx[static_cast<size_t>(i)];
+    for (const auto& kv : result.prepared.agg_by_idx[static_cast<size_t>(i)]) {
       const int target_rep = kv.first;
       const int64_t edges_raw = kv.second;
       const int64_t target_size = static_cast<int64_t>(
@@ -1031,19 +1216,21 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
         supernode_sizes_by_rep_[static_cast<size_t>(target_rep)]);
     for (size_t ia = 0; ia < entries.size(); ++ia) {
       const int a_idx = entries[ia].row_idx;
-      const int rep_a = prepared.q[static_cast<size_t>(a_idx)];
+      const int rep_a = result.prepared.q[static_cast<size_t>(a_idx)];
       if (target_rep == rep_a) {
         continue;
       }
-      const int64_t size_a = prepared.size_by_idx[static_cast<size_t>(a_idx)];
+      const int64_t size_a =
+          result.prepared.size_by_idx[static_cast<size_t>(a_idx)];
       const int64_t edges_a = entries[ia].edges;
       for (size_t ib = ia + 1; ib < entries.size(); ++ib) {
         const int b_idx = entries[ib].row_idx;
-        const int rep_b = prepared.q[static_cast<size_t>(b_idx)];
+        const int rep_b = result.prepared.q[static_cast<size_t>(b_idx)];
         if (target_rep == rep_b) {
           continue;
         }
-        const int64_t size_b = prepared.size_by_idx[static_cast<size_t>(b_idx)];
+        const int64_t size_b =
+            result.prepared.size_by_idx[static_cast<size_t>(b_idx)];
         const int64_t edges_b = entries[ib].edges;
         const int64_t old_cost =
             EncodeCostForPair(rep_a, size_a, target_rep, target_size, edges_a) +
@@ -1061,11 +1248,11 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
   }
 
   for (int i = 0; i < group_size; ++i) {
-    const int rep_i = prepared.q[static_cast<size_t>(i)];
+    const int rep_i = result.prepared.q[static_cast<size_t>(i)];
     if (I_[rep_i] == -1) {
       continue;
     }
-    for (const auto& kv : prepared.agg_by_idx[static_cast<size_t>(i)]) {
+    for (const auto& kv : result.prepared.agg_by_idx[static_cast<size_t>(i)]) {
       const int target_rep = kv.first;
       const auto row_it = row_index_by_rep.find(target_rep);
       if (row_it == row_index_by_rep.end()) {
@@ -1104,8 +1291,8 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
     if (proxy_gain <= 0) {
       continue;
     }
-    const int rep_a = prepared.q[static_cast<size_t>(a_idx)];
-    const int rep_b = prepared.q[static_cast<size_t>(b_idx)];
+    const int rep_a = result.prepared.q[static_cast<size_t>(a_idx)];
+    const int rep_b = result.prepared.q[static_cast<size_t>(b_idx)];
     const double proxy_ratio = static_cast<double>(proxy_gain) /
                                static_cast<double>(std::max<int64_t>(
                                    1, approx_old_cost_by_idx[static_cast<size_t>(a_idx)] +
@@ -1142,17 +1329,18 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
   for (uint64_t key : candidate_keys) {
     const int a_idx = static_cast<int>(key >> 32U);
     const int b_idx = static_cast<int>(key & 0xffffffffU);
-    prepared.candidate_pairs.push_back(EaCandidatePair{a_idx, b_idx, 0, 0});
+    result.prepared.candidate_pairs.push_back(
+        EaCandidatePair{a_idx, b_idx, 0, 0});
   }
-  stats_.merge_candidate_pairs_after_prune +=
-      static_cast<uint64_t>(prepared.candidate_pairs.size());
+  result.stats.candidate_pairs_after_prune =
+      static_cast<uint64_t>(result.prepared.candidate_pairs.size());
 
   const auto candidate_gen_end = std::chrono::steady_clock::now();
-  const double candidate_gen_ms =
+  result.stats.candidate_gen_ms =
       ElapsedMs(candidate_gen_start, candidate_gen_end);
-  stats_.merge_candidate_gen_ms += candidate_gen_ms;
-  stats_.merge_scoring_ms += candidate_gen_ms;
-  return prepared;
+  result.stats.wall_ms =
+      ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+  return result;
 }
 
 void Sweg::ScoreBatchEncodingAwarePreparedGroup(EaGroupPrepared* prepared,
@@ -1468,8 +1656,20 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlocked(
     return;
   }
 
+  ScoreBatchEncodingAwarePreparedGroupsBlockedRange(
+      prepared_groups, 0, prepared_groups->size(), threshold);
+}
+
+void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedRange(
+    std::vector<EaGroupPrepared>* prepared_groups, size_t begin, size_t end,
+    double threshold) {
+  if (prepared_groups == nullptr || begin >= end || end > prepared_groups->size()) {
+    return;
+  }
+
   if (scoring_backend_ == ScoringBackend::kCpu) {
-    for (EaGroupPrepared& prepared : *prepared_groups) {
+    for (size_t i = begin; i < end; ++i) {
+      EaGroupPrepared& prepared = (*prepared_groups)[i];
       ScoreBatchEncodingAwarePreparedGroup(&prepared, threshold);
     }
     return;
@@ -1478,18 +1678,25 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlocked(
       candidate_batch_budget_ > 0
           ? static_cast<size_t>(candidate_batch_budget_)
           : 0;
-  ScoreBatchEncodingAwarePreparedGroupsBlockedCuda(
-      prepared_groups, threshold, candidate_chunk_size);
+  ScoreBatchEncodingAwarePreparedGroupsBlockedCudaRange(
+      prepared_groups, begin, end, threshold, candidate_chunk_size);
 }
 
 Sweg::CudaBlockedBatch Sweg::BuildCudaBlockedBatch(
     const std::vector<EaGroupPrepared>& groups) const {
+  return BuildCudaBlockedBatch(groups, 0, groups.size());
+}
+
+Sweg::CudaBlockedBatch Sweg::BuildCudaBlockedBatch(
+    const std::vector<EaGroupPrepared>& groups, size_t begin,
+    size_t end) const {
   CudaBlockedBatch batch;
 
   size_t total_rows = 0;
   size_t total_nnz = 0;
   size_t total_candidates = 0;
-  for (const EaGroupPrepared& group : groups) {
+  for (size_t i = begin; i < end; ++i) {
+    const EaGroupPrepared& group = groups[i];
     total_rows += group.q.size();
     total_candidates += group.candidate_pairs.size();
     for (const SparseCounts& row : group.agg_by_idx) {
@@ -1509,7 +1716,7 @@ Sweg::CudaBlockedBatch Sweg::BuildCudaBlockedBatch(
   batch.flat_agg.offsets.push_back(0);
 
   int row_base = 0;
-  for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+  for (size_t group_idx = begin; group_idx < end; ++group_idx) {
     const EaGroupPrepared& group = groups[group_idx];
     if (group.agg_by_idx.size() != group.q.size() ||
         group.size_by_idx.size() != group.q.size() ||
@@ -1548,7 +1755,7 @@ Sweg::CudaBlockedBatch Sweg::BuildCudaBlockedBatch(
       batch.candidate_pairs.emplace_back(row_base + candidate.a_idx,
                                          row_base + candidate.b_idx);
       batch.destinations.push_back(
-          CudaBlockedBatch::Destination{group_idx, candidate_idx});
+          CudaBlockedBatch::Destination{group_idx - begin, candidate_idx});
     }
 
     row_base += static_cast<int>(group.q.size());
@@ -1574,7 +1781,19 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedCuda(
     return;
   }
 
-  CudaBlockedBatch batch = BuildCudaBlockedBatch(*prepared_groups);
+  ScoreBatchEncodingAwarePreparedGroupsBlockedCudaRange(
+      prepared_groups, 0, prepared_groups->size(), threshold,
+      candidate_chunk_size);
+}
+
+void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedCudaRange(
+    std::vector<EaGroupPrepared>* prepared_groups, size_t begin, size_t end,
+    double threshold, size_t candidate_chunk_size) {
+  if (prepared_groups == nullptr || begin >= end || end > prepared_groups->size()) {
+    return;
+  }
+
+  CudaBlockedBatch batch = BuildCudaBlockedBatch(*prepared_groups, begin, end);
   if (batch.candidate_pairs.empty()) {
     return;
   }
@@ -1596,10 +1815,10 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedCuda(
 
   for (size_t i = 0; i < gain_results.size(); ++i) {
     const CudaBlockedBatch::Destination& dst = batch.destinations[i];
-    if (dst.group_idx >= prepared_groups->size()) {
+    if (begin + dst.group_idx >= prepared_groups->size()) {
       throw std::runtime_error("destination group index out of range");
     }
-    EaGroupPrepared& group = (*prepared_groups)[dst.group_idx];
+    EaGroupPrepared& group = (*prepared_groups)[begin + dst.group_idx];
     if (dst.candidate_idx >= group.candidate_pairs.size()) {
       throw std::runtime_error("destination candidate index out of range");
     }
@@ -1608,8 +1827,8 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedCuda(
         gain_results[i].before_cost;
   }
 
-  for (EaGroupPrepared& prepared : *prepared_groups) {
-    FilterPreparedCandidatePairsByThreshold(&prepared, threshold);
+  for (size_t i = begin; i < end; ++i) {
+    FilterPreparedCandidatePairsByThreshold(&(*prepared_groups)[i], threshold);
   }
 }
 

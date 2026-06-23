@@ -314,6 +314,9 @@ void EnsureDeviceCapacity(T** ptr, size_t* capacity, size_t required,
 }  // namespace
 
 struct Sweg::CudaScoringCache {
+  size_t slice_memory_budget_bytes = 0;
+  bool slice_memory_budget_initialized = false;
+
   int* d_offsets = nullptr;
   int* d_row_rep_ids = nullptr;
   int* d_neighbors = nullptr;
@@ -672,6 +675,44 @@ bool CudaScoringCompiled() { return true; }
 
 Sweg::~Sweg() = default;
 
+void Sweg::EnsureCudaScoringCache() {
+  if (cuda_cache_) {
+    return;
+  }
+  const auto init_start = Clock::now();
+  cuda_cache_ = std::make_shared<CudaScoringCache>();
+  stats_.cuda_init_ms += ElapsedMs(init_start, Clock::now());
+}
+
+size_t Sweg::QueryCudaSliceMemoryBudgetBytes() {
+  EnsureCudaScoringCache();
+  CudaScoringCache& cache = *cuda_cache_;
+  if (cache.slice_memory_budget_initialized) {
+    return cache.slice_memory_budget_bytes;
+  }
+
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  CheckCuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+  const size_t reserve_bytes = free_bytes / 5;
+  const size_t usable_after_reserve =
+      free_bytes > reserve_bytes ? (free_bytes - reserve_bytes) : 0;
+  const size_t quarter_free = free_bytes / 4;
+  const size_t auto_budget =
+      std::min(static_cast<size_t>(512ULL * 1024ULL * 1024ULL),
+               std::min(usable_after_reserve, quarter_free));
+  cache.slice_memory_budget_bytes = auto_budget;
+  cache.slice_memory_budget_initialized = true;
+  return cache.slice_memory_budget_bytes;
+}
+
+size_t Sweg::GetCudaSliceMemoryBudgetBytes() {
+  if (cuda_slice_memory_mb_ > 0) {
+    return static_cast<size_t>(cuda_slice_memory_mb_) * 1024ULL * 1024ULL;
+  }
+  return QueryCudaSliceMemoryBudgetBytes();
+}
+
 std::vector<Sweg::LocalGainResult> Sweg::ScoreCandidatesCuda(
     const std::vector<std::pair<int, int>>& candidate_pairs,
     const FlatAggCSR& flat_agg, size_t candidate_chunk_size) {
@@ -679,9 +720,7 @@ std::vector<Sweg::LocalGainResult> Sweg::ScoreCandidatesCuda(
     return {};
   }
 
-  if (!cuda_cache_) {
-    cuda_cache_ = std::make_shared<CudaScoringCache>();
-  }
+  EnsureCudaScoringCache();
   CudaScoringCache& cache = *cuda_cache_;
 
   const auto cuda_total_start = Clock::now();

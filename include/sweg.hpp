@@ -65,6 +65,8 @@ struct RuntimeStats {
   int64_t divide_max_group_size = 0;
   int64_t divide_fallback_splits = 0;
 
+  double merge_prepare_wall_ms = 0.0;
+  double merge_prepare_task_sum_ms = 0.0;
   double merge_create_w_ms = 0.0;
   double merge_scoring_ms = 0.0;
   double merge_candidate_gen_ms = 0.0;
@@ -90,18 +92,32 @@ struct RuntimeStats {
   double threshold_acceptance_scale = 1.0;
   double threshold_acceptance_rate_last = 0.0;
   uint64_t threshold_sample_count_last = 0;
+  double cuda_init_ms = 0.0;
   double cuda_h2d_ms = 0.0;
   double cuda_row_h2d_ms = 0.0;
   double cuda_pair_h2d_ms = 0.0;
   double cuda_kernel_ms = 0.0;
   double cuda_d2h_ms = 0.0;
   double cuda_total_ms = 0.0;
+  double cuda_packed_h2d_ms = 0.0;
+  double cuda_packed_d2h_ms = 0.0;
   int64_t cuda_num_calls = 0;
   int64_t cuda_row_uploads = 0;
   int64_t cuda_kernel_launches = 0;
   int64_t cuda_h2d_bytes = 0;
   int64_t cuda_d2h_bytes = 0;
   int64_t cuda_max_candidates_per_launch = 0;
+  int64_t cuda_packed_h2d_calls = 0;
+  int64_t cuda_packed_d2h_calls = 0;
+  int64_t cuda_packed_input_bytes = 0;
+  int64_t cuda_packed_output_bytes = 0;
+  int64_t cuda_slice_count = 0;
+  int64_t cuda_blocks_single_slice = 0;
+  int64_t cuda_blocks_multi_slice = 0;
+  int64_t cuda_max_slice_rows = 0;
+  int64_t cuda_max_slice_nnz = 0;
+  int64_t cuda_max_slice_candidates = 0;
+  int64_t cuda_slice_memory_budget_bytes = 0;
 
   int64_t overflow_groups_seen = 0;
   int64_t overflow_refined_subgroups = 0;
@@ -137,6 +153,7 @@ class Sweg {
                 bool ea_use_threshold, uint64_t seed,
                 ScoringBackend scoring_backend, bool verify_cuda_gain,
                 int group_batch_size, int candidate_batch_budget,
+                int cuda_slice_memory_mb,
                 int overflow_group_gmax, int overflow_refine_rounds,
                 int divide_hash_dims, int divide_max_group,
                 const ThresholdConfig& threshold_config);
@@ -190,6 +207,25 @@ class Sweg {
     uint32_t epoch = 1;
   };
 
+  struct PrepareWorkspace {
+    ParallelScratch scratch;
+  };
+
+  struct EaPrepareStats {
+    double wall_ms = 0.0;
+    double create_w_ms = 0.0;
+    double candidate_gen_ms = 0.0;
+    uint64_t group_count = 0;
+    uint64_t group_max_size = 0;
+    uint64_t raw_pair_count = 0;
+    uint64_t candidate_pairs_after_prune = 0;
+  };
+
+  struct EaPrepareResult {
+    EaGroupPrepared prepared;
+    EaPrepareStats stats;
+  };
+
   struct OverflowRefineCounters {
     int64_t overflow_groups_seen = 0;
     int64_t refined_subgroups = 0;
@@ -207,6 +243,15 @@ class Sweg {
     FlatAggCSR flat_agg;
     std::vector<std::pair<int, int>> candidate_pairs;
     std::vector<Destination> destinations;
+  };
+
+  struct CudaSliceSpan {
+    size_t begin = 0;
+    size_t end = 0;
+    size_t rows = 0;
+    size_t nnz = 0;
+    size_t candidates = 0;
+    size_t estimated_bytes = 0;
   };
 
   void ShuffleArray();
@@ -238,6 +283,9 @@ class Sweg {
   std::vector<std::vector<int>> RefineOverflowGroup(
       const std::vector<int>& q, OverflowRefineCounters* counters);
   EaGroupPrepared PrepareBatchEncodingAwareGroup(const std::vector<int>& q);
+  EaPrepareResult PrepareBatchEncodingAwareGroupWithWorkspace(
+      const std::vector<int>& q, PrepareWorkspace* workspace,
+      bool allow_inner_parallel);
   void ScoreBatchEncodingAwarePreparedGroup(EaGroupPrepared* prepared,
                                             double threshold);
   void AssignGainResultsToPreparedGroup(
@@ -252,8 +300,17 @@ class Sweg {
   void ScoreBatchEncodingAwarePreparedGroupsBlockedCuda(
       std::vector<EaGroupPrepared>* prepared_groups, double threshold,
       size_t candidate_chunk_size);
+  void ScoreBatchEncodingAwarePreparedGroupsBlockedRange(
+      std::vector<EaGroupPrepared>* prepared_groups, size_t begin, size_t end,
+      double threshold);
+  void ScoreBatchEncodingAwarePreparedGroupsBlockedCudaRange(
+      std::vector<EaGroupPrepared>* prepared_groups, size_t begin, size_t end,
+      double threshold, size_t candidate_chunk_size);
   CudaBlockedBatch BuildCudaBlockedBatch(
       const std::vector<EaGroupPrepared>& groups) const;
+  CudaBlockedBatch BuildCudaBlockedBatch(
+      const std::vector<EaGroupPrepared>& groups, size_t begin,
+      size_t end) const;
   SparseCounts AggregateWBySupernode(const SparseCounts& w) const;
   int64_t EdgeCountToSupernode(const SparseCounts& aggregated, int target_rep,
                                bool self_loop) const;
@@ -283,12 +340,23 @@ class Sweg {
   int OverflowSupernodeShingle(int rep, uint64_t seed) const;
   void ResetScratch() const;
   void ResetParallelScratch(ParallelScratch& scratch) const;
-  void EnsureParallelWorkspaces(int thread_count) const;
+  void EnsurePrepareWorkspace(PrepareWorkspace* workspace) const;
+  void EnsurePrepareWorkspaces(int thread_count) const;
+  void AccumulatePrepareStats(const EaPrepareStats& prepare_stats);
   SparseCounts CreateWForSupernodeWithScratch(
       int rep, ParallelScratch& scratch,
       int64_t* self_loop_count = nullptr) const;
   SparseCounts AggregateWBySupernodeWithScratch(
       const SparseCounts& w, ParallelScratch& scratch) const;
+  size_t EstimateCudaSliceBytes(size_t total_rows, size_t total_nnz,
+                                size_t total_candidates,
+                                size_t candidate_chunk_size) const;
+  std::vector<CudaSliceSpan> BuildCudaSlicePlan(
+      const std::vector<EaGroupPrepared>& prepared_groups,
+      size_t candidate_chunk_size);
+  void EnsureCudaScoringCache();
+  size_t GetCudaSliceMemoryBudgetBytes();
+  size_t QueryCudaSliceMemoryBudgetBytes();
   const CSRGraph* graph_;
   int n_;
   std::vector<int> h_;
@@ -306,6 +374,7 @@ class Sweg {
   bool verify_cuda_gain_;
   int group_batch_size_;
   int candidate_batch_budget_;
+  int cuda_slice_memory_mb_;
   int overflow_group_gmax_;
   int overflow_refine_rounds_;
   int divide_hash_dims_;
@@ -324,7 +393,7 @@ class Sweg {
   size_t cuda_verify_samples_remaining_ = 0;
   uint64_t cuda_verify_call_counter_ = 0;
   mutable ParallelScratch serial_workspace_;
-  mutable std::vector<ParallelScratch> parallel_workspaces_;
+  mutable std::vector<PrepareWorkspace> prepare_workspaces_;
   mutable std::vector<int64_t> scratch_counts_;
   mutable std::vector<uint32_t> scratch_marks_;
   mutable std::vector<int> scratch_touched_;
