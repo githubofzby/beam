@@ -50,6 +50,23 @@ enum class CertificationMode {
   kSafe,
 };
 
+enum class CommitPolicy {
+  kGreedyFull,
+  kSequentialOne,
+  kTransactional2,
+  kTransactional4,
+  kTransactional8,
+  kMutualBest4,
+};
+
+struct CommitAuditRow {
+  uint64_t batch_id = 0;
+  uint64_t batch_size = 0;
+  EncodingCost partition_exact_cost = 0;
+  int64_t cumulative_realized_gain = 0;
+  uint64_t rejected_pair_count = 0;
+};
+
 enum class ThresholdPolicy {
   kReciprocal,
   kMagsGeom,
@@ -227,6 +244,23 @@ struct RuntimeStats {
   uint64_t merge_candidate_pairs_after_prune = 0;
   uint64_t merge_exact_gain_calls = 0;
   uint64_t merge_positive_gain_pairs = 0;
+  int64_t isolated_gain_sum = 0;
+  int64_t realized_marginal_gain_sum = 0;
+  int64_t actual_batch_cost_reduction = 0;
+  int64_t interaction_delta = 0;
+  uint64_t selected_merges_for_validation = 0;
+  uint64_t accepted_merges_after_validation = 0;
+  uint64_t rejected_nonpositive = 0;
+  uint64_t stale_endpoint = 0;
+  uint64_t gain_decreased = 0;
+  uint64_t gain_increased = 0;
+  uint64_t negative_marginal = 0;
+  uint64_t candidate_refresh_count = 0;
+  uint64_t original_exact_calls = 0;
+  uint64_t validation_exact_calls = 0;
+  uint64_t validation_exact_row_entry_work = 0;
+  double commit_validation_ms = 0.0;
+  double audit_oracle_ms = 0.0;
   uint64_t update_touched_quotient_entries = 0;
   uint64_t quotient_nnz_final = 0;
   uint64_t quotient_incremental_batch_count = 0;
@@ -386,7 +420,9 @@ class Sweg {
                     CandidateIndexMode::kLegacy,
                 int candidate_budget = 8,
                 CertificationMode certification_mode =
-                    CertificationMode::kOff);
+                    CertificationMode::kOff,
+                CommitPolicy commit_policy = CommitPolicy::kGreedyFull,
+                bool commit_audit = false);
 
   void Run(int iterations, int print_offset);
   void Divide(int iter);
@@ -402,6 +438,10 @@ class Sweg {
   int gstart() const { return gstart_; }
   const RuntimeStats& runtime_stats() const { return stats_; }
   const RuntimeProfile& runtime_profile() const { return runtime_profile_; }
+  const std::vector<CommitAuditRow>& commit_audit_rows() const {
+    return commit_audit_rows_;
+  }
+  uint64_t PartitionHash() const;
   const std::vector<int>& supernode_sizes_by_rep() const {
     return supernode_sizes_by_rep_;
   }
@@ -587,6 +627,8 @@ class Sweg {
   std::vector<int> CurrentPartitionLabels() const;
   bool ValidateMergeAgainstCurrentPartition(int rep_a, int rep_b) const;
   void CommitSelectedPairs(const std::vector<std::pair<int, int>>& pairs);
+  void CommitSelectedPairsTransactional(
+      const std::vector<std::pair<int, int>>& pairs);
   LocalGainResult ComputeLocalEncodingGain(const QuotientRowView& agg_a,
                                            const QuotientRowView& agg_b, int rep_a,
                                            int rep_b, int64_t size_a,
@@ -673,6 +715,11 @@ class Sweg {
   CandidateIndexMode candidate_index_mode_ = CandidateIndexMode::kLegacy;
   int candidate_budget_ = 8;
   CertificationMode certification_mode_ = CertificationMode::kOff;
+  CommitPolicy commit_policy_ = CommitPolicy::kGreedyFull;
+  bool commit_audit_ = false;
+  uint64_t commit_batch_id_ = 0;
+  std::vector<CommitAuditRow> commit_audit_rows_;
+  std::unordered_map<uint64_t, MergeGain> selected_isolated_gain_;
   std::unique_ptr<CandidateIndex> candidate_index_;
   bool candidate_index_built_ = false;
   bool quotient_batch_precommitted_ = false;
@@ -709,3 +756,4 @@ class Sweg {
 const char* MergeModeToString(MergeMode mode);
 const char* ScoringBackendToString(ScoringBackend backend);
 const char* ThresholdPolicyToString(ThresholdPolicy policy);
+const char* CommitPolicyToString(CommitPolicy policy);

@@ -87,6 +87,18 @@ const char* ThresholdPolicyToString(ThresholdPolicy policy) {
   return "unknown";
 }
 
+const char* CommitPolicyToString(CommitPolicy policy) {
+  switch (policy) {
+    case CommitPolicy::kGreedyFull: return "g0";
+    case CommitPolicy::kSequentialOne: return "s1";
+    case CommitPolicy::kTransactional2: return "t2";
+    case CommitPolicy::kTransactional4: return "t4";
+    case CommitPolicy::kTransactional8: return "t8";
+    case CommitPolicy::kMutualBest4: return "m4";
+  }
+  return "unknown";
+}
+
 Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
            bool ea_use_threshold, uint64_t seed,
            ScoringBackend scoring_backend, bool verify_cuda_gain,
@@ -99,7 +111,8 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
            StateBackend state_backend, bool validate_quotient,
            QuotientUpdateMode quotient_update_mode,
            CandidateIndexMode candidate_index_mode, int candidate_budget,
-           CertificationMode certification_mode)
+           CertificationMode certification_mode, CommitPolicy commit_policy,
+           bool commit_audit)
     : graph_(&graph),
       n_(graph.n),
       merge_mode_(merge_mode),
@@ -122,6 +135,8 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
       candidate_index_mode_(candidate_index_mode),
       candidate_budget_(std::max(1, candidate_budget)),
       certification_mode_(certification_mode),
+      commit_policy_(commit_policy),
+      commit_audit_(commit_audit),
       seed64_(seed) {
   runtime_profile_.mode = profiling_mode;
   h_.resize(n_);
@@ -1168,6 +1183,7 @@ void Sweg::Merge(int iter, int total_iterations) {
 
 void Sweg::RefreshCandidateIndex(uint64_t epoch_seed) {
   if (candidate_index_ == nullptr) return;
+  ++stats_.candidate_refresh_count;
   candidate_active_reps_.clear();
   for (int rep = 0; rep < n_; ++rep) {
     if (I_[rep] != -1 && quotient_graph_->IsActive(rep)) {
@@ -2178,8 +2194,37 @@ std::vector<std::pair<int, int>> Sweg::SelectScoredBatchEncodingAwareGroupPairs(
 
   std::vector<EaCandidatePair> scored_pairs = prepared.candidate_pairs;
   const auto selection_start = std::chrono::steady_clock::now();
+  std::vector<int> best_target(static_cast<size_t>(group_size), -1);
+  if (commit_policy_ == CommitPolicy::kMutualBest4) {
+    std::vector<const EaCandidatePair*> best(static_cast<size_t>(group_size),
+                                             nullptr);
+    auto better = [](const EaCandidatePair& lhs, const EaCandidatePair& rhs) {
+      if (lhs.gain != rhs.gain) return lhs.gain > rhs.gain;
+      if (lhs.a_idx != rhs.a_idx) return lhs.a_idx < rhs.a_idx;
+      return lhs.b_idx < rhs.b_idx;
+    };
+    for (const EaCandidatePair& pair : scored_pairs) {
+      for (const int endpoint : {pair.a_idx, pair.b_idx}) {
+        if (best[static_cast<size_t>(endpoint)] == nullptr ||
+            better(pair, *best[static_cast<size_t>(endpoint)])) {
+          best[static_cast<size_t>(endpoint)] = &pair;
+          best_target[static_cast<size_t>(endpoint)] =
+              endpoint == pair.a_idx ? pair.b_idx : pair.a_idx;
+        }
+      }
+    }
+  }
   std::sort(scored_pairs.begin(), scored_pairs.end(),
-            [](const EaCandidatePair& lhs, const EaCandidatePair& rhs) {
+            [&](const EaCandidatePair& lhs, const EaCandidatePair& rhs) {
+              if (commit_policy_ == CommitPolicy::kMutualBest4) {
+                const bool lhs_mutual =
+                    best_target[static_cast<size_t>(lhs.a_idx)] == lhs.b_idx &&
+                    best_target[static_cast<size_t>(lhs.b_idx)] == lhs.a_idx;
+                const bool rhs_mutual =
+                    best_target[static_cast<size_t>(rhs.a_idx)] == rhs.b_idx &&
+                    best_target[static_cast<size_t>(rhs.b_idx)] == rhs.a_idx;
+                if (lhs_mutual != rhs_mutual) return lhs_mutual;
+              }
               if (lhs.gain != rhs.gain) {
                 return lhs.gain > rhs.gain;
               }
@@ -2208,6 +2253,14 @@ std::vector<std::pair<int, int>> Sweg::SelectScoredBatchEncodingAwareGroupPairs(
     selected_rep_pairs.emplace_back(
         prepared.q[static_cast<size_t>(pair.a_idx)],
         prepared.q[static_cast<size_t>(pair.b_idx)]);
+    const uint32_t rep_a = static_cast<uint32_t>(
+        prepared.q[static_cast<size_t>(pair.a_idx)]);
+    const uint32_t rep_b = static_cast<uint32_t>(
+        prepared.q[static_cast<size_t>(pair.b_idx)]);
+    const uint32_t lo = std::min(rep_a, rep_b);
+    const uint32_t hi = std::max(rep_a, rep_b);
+    selected_isolated_gain_[(static_cast<uint64_t>(lo) << 32U) | hi] =
+        pair.gain;
     total_local_gain += pair.gain;
   }
   const auto selection_end = std::chrono::steady_clock::now();
@@ -2611,14 +2664,60 @@ void Sweg::MergeBatchEncodingAwareGroup(const std::vector<int>& q,
 
 void Sweg::CommitSelectedPairs(
     const std::vector<std::pair<int, int>>& pairs) {
+  if (commit_policy_ != CommitPolicy::kGreedyFull &&
+      quotient_graph_ != nullptr &&
+      cost_objective_ == CostObjective::kMagsCompatible) {
+    CommitSelectedPairsTransactional(pairs);
+    return;
+  }
   std::vector<std::pair<int, int>> valid;
   valid.reserve(pairs.size());
+  EncodingCost audit_cost_before = 0;
+  if (commit_audit_ && quotient_graph_ != nullptr) {
+    const auto audit_before_start = std::chrono::steady_clock::now();
+    audit_cost_before = quotient_graph_->ExactCost();
+    stats_.audit_oracle_ms +=
+        ElapsedMs(audit_before_start, std::chrono::steady_clock::now());
+  }
+  int64_t isolated_sum = 0;
   for (const auto& pair : pairs) {
-    if (I_[pair.first] != -1 && I_[pair.second] != -1 &&
-        ValidateMergeAgainstCurrentPartition(pair.first, pair.second)) {
+    const uint32_t lo = static_cast<uint32_t>(std::min(pair.first, pair.second));
+    const uint32_t hi = static_cast<uint32_t>(std::max(pair.first, pair.second));
+    const auto isolated_it = selected_isolated_gain_.find(
+        (static_cast<uint64_t>(lo) << 32U) | hi);
+    if (isolated_it != selected_isolated_gain_.end()) {
+      isolated_sum += isolated_it->second;
+    }
+    ++stats_.selected_merges_for_validation;
+    if (I_[pair.first] == -1 || I_[pair.second] == -1) {
+      ++stats_.stale_endpoint;
+      continue;
+    }
+    bool accept = true;
+    if (cost_objective_ == CostObjective::kMagsCompatible &&
+        quotient_graph_ != nullptr) {
+      const auto validation_start = std::chrono::steady_clock::now();
+      ExactGainWorkCounters work;
+      const MergeGain gain = quotient_graph_->ExactMergeGainPersistent(
+          pair.first, pair.second, &work).gain;
+      stats_.commit_validation_ms +=
+          ElapsedMs(validation_start, std::chrono::steady_clock::now());
+      ++stats_.validation_exact_calls;
+      stats_.validation_exact_row_entry_work +=
+          work.raw_entries_a + work.raw_entries_b;
+      accept = gain > 0;
+      if (!accept) {
+        ++stats_.rejected_nonpositive;
+        ++stats_.negative_marginal;
+      }
+    } else {
+      accept = ValidateMergeAgainstCurrentPartition(pair.first, pair.second);
+    }
+    if (accept) {
       valid.push_back(pair);
     }
   }
+  stats_.isolated_gain_sum += isolated_sum;
 
   const bool may_bulk = quotient_graph_ != nullptr && valid.size() > 1 &&
                         cost_objective_ == CostObjective::kLegacy;
@@ -2646,11 +2745,158 @@ void Sweg::CommitSelectedPairs(
   for (const auto& pair : valid) {
     Update_S(pair.first, pair.second);
   }
+  stats_.accepted_merges_after_validation += valid.size();
   quotient_batch_precommitted_ = false;
   if (validate_quotient_ && quotient_graph_ != nullptr) {
     quotient_graph_->ValidateAgainstOriginalGraph(*graph_,
                                                   CurrentPartitionLabels());
   }
+  if (commit_audit_ && quotient_graph_ != nullptr) {
+    const auto audit_after_start = std::chrono::steady_clock::now();
+    const EncodingCost audit_cost_after = quotient_graph_->ExactCost();
+    stats_.audit_oracle_ms +=
+        ElapsedMs(audit_after_start, std::chrono::steady_clock::now());
+    const int64_t reduction = audit_cost_before - audit_cost_after;
+    stats_.actual_batch_cost_reduction += reduction;
+    stats_.realized_marginal_gain_sum += reduction;
+    stats_.interaction_delta =
+        stats_.isolated_gain_sum - stats_.actual_batch_cost_reduction;
+    commit_audit_rows_.push_back(CommitAuditRow{
+        ++commit_batch_id_, valid.size(), audit_cost_after,
+        stats_.realized_marginal_gain_sum,
+        static_cast<uint64_t>(pairs.size() - valid.size())});
+  }
+}
+
+void Sweg::CommitSelectedPairsTransactional(
+    const std::vector<std::pair<int, int>>& pairs) {
+  struct PendingPair {
+    int a = -1;
+    int b = -1;
+    MergeGain isolated_gain = 0;
+    MergeGain current_gain = 0;
+  };
+  auto pair_key = [](int a, int b) {
+    const uint32_t lo = static_cast<uint32_t>(std::min(a, b));
+    const uint32_t hi = static_cast<uint32_t>(std::max(a, b));
+    return (static_cast<uint64_t>(lo) << 32U) | hi;
+  };
+  size_t micro_batch_size = 1;
+  if (commit_policy_ == CommitPolicy::kTransactional2) micro_batch_size = 2;
+  if (commit_policy_ == CommitPolicy::kTransactional4 ||
+      commit_policy_ == CommitPolicy::kMutualBest4) micro_batch_size = 4;
+  if (commit_policy_ == CommitPolicy::kTransactional8) micro_batch_size = 8;
+
+  std::vector<PendingPair> pending;
+  pending.reserve(pairs.size());
+  for (const auto& [a, b] : pairs) {
+    PendingPair candidate;
+    candidate.a = a;
+    candidate.b = b;
+    const auto it = selected_isolated_gain_.find(pair_key(a, b));
+    candidate.isolated_gain =
+        it == selected_isolated_gain_.end() ? 0 : it->second;
+    pending.push_back(candidate);
+    stats_.isolated_gain_sum += candidate.isolated_gain;
+  }
+  stats_.selected_merges_for_validation += pending.size();
+
+  while (!pending.empty()) {
+    const auto validation_start = std::chrono::steady_clock::now();
+    for (PendingPair& candidate : pending) {
+      if (I_[candidate.a] == -1 || I_[candidate.b] == -1) {
+        candidate.current_gain = std::numeric_limits<MergeGain>::min();
+        continue;
+      }
+      ExactGainWorkCounters work;
+      const QuotientMergeGainResult result =
+          quotient_graph_->ExactMergeGainPersistent(candidate.a, candidate.b,
+                                                     &work);
+      candidate.current_gain = result.gain;
+      ++stats_.validation_exact_calls;
+      stats_.validation_exact_row_entry_work +=
+          work.raw_entries_a + work.raw_entries_b;
+    }
+    stats_.commit_validation_ms +=
+        ElapsedMs(validation_start, std::chrono::steady_clock::now());
+
+    std::sort(pending.begin(), pending.end(), [](const PendingPair& lhs,
+                                                 const PendingPair& rhs) {
+      if (lhs.current_gain != rhs.current_gain) {
+        return lhs.current_gain > rhs.current_gain;
+      }
+      const int lhs_lo = std::min(lhs.a, lhs.b);
+      const int rhs_lo = std::min(rhs.a, rhs.b);
+      if (lhs_lo != rhs_lo) return lhs_lo < rhs_lo;
+      return std::max(lhs.a, lhs.b) < std::max(rhs.a, rhs.b);
+    });
+
+    const auto audit_start = std::chrono::steady_clock::now();
+    const EncodingCost cost_before =
+        commit_audit_ ? quotient_graph_->ExactCost() : 0;
+    stats_.audit_oracle_ms +=
+        ElapsedMs(audit_start, std::chrono::steady_clock::now());
+
+    const size_t take = std::min(micro_batch_size, pending.size());
+    uint64_t accepted = 0;
+    uint64_t rejected = 0;
+    int64_t realized = 0;
+    for (size_t i = 0; i < take; ++i) {
+      PendingPair& candidate = pending[i];
+      if (candidate.current_gain == std::numeric_limits<MergeGain>::min()) {
+        ++stats_.stale_endpoint;
+        ++rejected;
+        continue;
+      }
+      const auto marginal_start = std::chrono::steady_clock::now();
+      ExactGainWorkCounters marginal_work;
+      const QuotientMergeGainResult marginal =
+          quotient_graph_->ExactMergeGainPersistent(candidate.a, candidate.b,
+                                                     &marginal_work);
+      stats_.commit_validation_ms +=
+          ElapsedMs(marginal_start, std::chrono::steady_clock::now());
+      ++stats_.validation_exact_calls;
+      stats_.validation_exact_row_entry_work +=
+          marginal_work.raw_entries_a + marginal_work.raw_entries_b;
+      candidate.current_gain = marginal.gain;
+      if (candidate.current_gain < candidate.isolated_gain) {
+        ++stats_.gain_decreased;
+      } else if (candidate.current_gain > candidate.isolated_gain) {
+        ++stats_.gain_increased;
+      }
+      if (candidate.current_gain <= 0) {
+        ++stats_.rejected_nonpositive;
+        ++stats_.negative_marginal;
+        ++rejected;
+        continue;
+      }
+      realized += candidate.current_gain;
+      Update_S(candidate.a, candidate.b);
+      ++accepted;
+    }
+    stats_.accepted_merges_after_validation += accepted;
+    stats_.realized_marginal_gain_sum += realized;
+    stats_.actual_batch_cost_reduction += realized;
+
+    if (commit_audit_) {
+      const auto after_start = std::chrono::steady_clock::now();
+      const EncodingCost cost_after = quotient_graph_->ExactCost();
+      stats_.audit_oracle_ms +=
+          ElapsedMs(after_start, std::chrono::steady_clock::now());
+      const int64_t reduction = cost_before - cost_after;
+      if (reduction != realized || reduction < 0) {
+        throw std::runtime_error(
+            "transaction marginal gains differ from exact batch reduction");
+      }
+      commit_audit_rows_.push_back(CommitAuditRow{
+          ++commit_batch_id_, accepted, cost_after,
+          stats_.realized_marginal_gain_sum, rejected});
+    }
+    pending.erase(pending.begin(), pending.begin() +
+                                     static_cast<std::ptrdiff_t>(take));
+  }
+  stats_.interaction_delta =
+      stats_.isolated_gain_sum - stats_.actual_batch_cost_reduction;
 }
 
 std::vector<int> Sweg::CurrentPartitionLabels() const {
@@ -2669,6 +2915,16 @@ std::vector<int> Sweg::CurrentPartitionLabels() const {
     throw std::runtime_error("Partition contains an unlabeled node");
   }
   return labels;
+}
+
+uint64_t Sweg::PartitionHash() const {
+  const std::vector<int> labels = CurrentPartitionLabels();
+  uint64_t hash = 1469598103934665603ULL;
+  for (int label : labels) {
+    hash ^= static_cast<uint64_t>(static_cast<uint32_t>(label));
+    hash *= 1099511628211ULL;
+  }
+  return hash;
 }
 
 bool Sweg::ValidateMergeAgainstCurrentPartition(int rep_a, int rep_b) const {

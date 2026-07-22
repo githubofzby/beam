@@ -48,6 +48,9 @@ struct CliOptions {
   CandidateIndexMode candidate_index_mode = CandidateIndexMode::kLegacy;
   int candidate_budget = 8;
   CertificationMode certification_mode = CertificationMode::kOff;
+  CommitPolicy commit_policy = CommitPolicy::kGreedyFull;
+  bool commit_audit = false;
+  std::string commit_audit_csv;
   std::string profile_csv;
   bool show_help = false;
 };
@@ -76,6 +79,9 @@ static void PrintUsage() {
       << "  --candidate-index <legacy|quotient-neighbor|residual-signature> Candidate proposal backend (default: legacy)\n"
       << "  --candidate-budget <int> Per-source proposal budget (default: 8)\n"
       << "  --certification <off|safe> Safe persistent CPU exact certification (default: off)\n"
+      << "  --commit-policy <g0|s1|t2|t4|t8|m4> Fixed-candidate commit policy (default: g0)\n"
+      << "  --commit-audit      Verify and record exact-cost commit trajectory\n"
+      << "  --commit-audit-csv <path> Write long-form commit trajectory CSV\n"
       << "  --profiling <off|summary|rounds> Collect Stage 0 runtime profile (default: off)\n"
       << "  --profile-csv <path>    Write long-form per-iteration profile CSV\n"
       << "  --top-k <int>           Top-k EA-proxy candidates per supernode for batch-ea modes\n"
@@ -159,6 +165,16 @@ static CertificationMode ParseCertificationMode(const std::string& value) {
     return CertificationMode::kSafe;
   }
   throw std::runtime_error("Unsupported certification mode: " + value);
+}
+
+static CommitPolicy ParseCommitPolicy(const std::string& value) {
+  if (value == "g0") return CommitPolicy::kGreedyFull;
+  if (value == "s1") return CommitPolicy::kSequentialOne;
+  if (value == "t2") return CommitPolicy::kTransactional2;
+  if (value == "t4") return CommitPolicy::kTransactional4;
+  if (value == "t8") return CommitPolicy::kTransactional8;
+  if (value == "m4") return CommitPolicy::kMutualBest4;
+  throw std::runtime_error("Unsupported commit policy: " + value);
 }
 
 static const char* CertificationModeToString(CertificationMode mode) {
@@ -340,6 +356,13 @@ static CliOptions ParseArgs(int argc, char** argv) {
       opts.candidate_budget = std::stoi(argv[++i]);
     } else if (arg == "--certification" && i + 1 < argc) {
       opts.certification_mode = ParseCertificationMode(argv[++i]);
+    } else if (arg == "--commit-policy" && i + 1 < argc) {
+      opts.commit_policy = ParseCommitPolicy(argv[++i]);
+    } else if (arg == "--commit-audit") {
+      opts.commit_audit = true;
+    } else if (arg == "--commit-audit-csv" && i + 1 < argc) {
+      opts.commit_audit_csv = argv[++i];
+      opts.commit_audit = true;
     } else if (arg == "--profiling" && i + 1 < argc) {
       opts.profiling_mode = ParseProfilingMode(argv[++i]);
     } else if (arg == "--profile-csv" && i + 1 < argc) {
@@ -504,7 +527,7 @@ int main(int argc, char** argv) {
               opts.profiling_mode, opts.cost_objective, opts.state_backend,
               opts.validate_quotient, opts.quotient_update_mode,
               opts.candidate_index_mode, opts.candidate_budget,
-              opts.certification_mode);
+              opts.certification_mode, opts.commit_policy, opts.commit_audit);
     sweg.Run(opts.iterations, opts.print_offset);
 
     const auto encode_start = std::chrono::steady_clock::now();
@@ -569,6 +592,8 @@ int main(int argc, char** argv) {
     PrintMetric("state_backend", StateBackendToString(opts.state_backend));
     PrintMetric("certification",
                 CertificationModeToString(opts.certification_mode));
+    PrintMetric("commit_policy", CommitPolicyToString(opts.commit_policy));
+    PrintMetric("partition_hash", std::to_string(sweg.PartitionHash()));
     PrintMetric("validate_quotient", opts.validate_quotient ? "true" : "false");
     PrintMetric("quotient_update",
                 QuotientUpdateModeToString(opts.quotient_update_mode));
@@ -698,6 +723,41 @@ int main(int argc, char** argv) {
     PrintMetric("upper_bound_ms", FormatDouble(stats.upper_bound_ms));
     PrintMetric("early_abort_exact_ms",
                 FormatDouble(stats.early_abort_exact_ms));
+    stats.original_exact_calls = stats.merge_exact_gain_calls;
+    PrintMetric("isolated_gain_sum", std::to_string(stats.isolated_gain_sum));
+    PrintMetric("realized_marginal_gain_sum",
+                std::to_string(stats.realized_marginal_gain_sum));
+    PrintMetric("actual_batch_cost_reduction",
+                std::to_string(stats.actual_batch_cost_reduction));
+    PrintMetric("interaction_delta", std::to_string(stats.interaction_delta));
+    PrintMetric("gain_decay_ratio",
+                FormatDouble(static_cast<double>(stats.isolated_gain_sum -
+                                                 stats.realized_marginal_gain_sum) /
+                             std::max<int64_t>(1, stats.isolated_gain_sum)));
+    PrintMetric("selected_merges_for_validation",
+                std::to_string(stats.selected_merges_for_validation));
+    PrintMetric("accepted_merges_after_validation",
+                std::to_string(stats.accepted_merges_after_validation));
+    PrintMetric("rejected_nonpositive",
+                std::to_string(stats.rejected_nonpositive));
+    PrintMetric("stale_endpoint", std::to_string(stats.stale_endpoint));
+    PrintMetric("gain_decreased", std::to_string(stats.gain_decreased));
+    PrintMetric("gain_increased", std::to_string(stats.gain_increased));
+    PrintMetric("negative_marginal", std::to_string(stats.negative_marginal));
+    PrintMetric("candidate_refresh_count",
+                std::to_string(stats.candidate_refresh_count));
+    PrintMetric("original_exact_calls",
+                std::to_string(stats.original_exact_calls));
+    PrintMetric("validation_exact_calls",
+                std::to_string(stats.validation_exact_calls));
+    PrintMetric("total_exact_calls",
+                std::to_string(stats.original_exact_calls +
+                               stats.validation_exact_calls));
+    PrintMetric("validation_exact_row_entry_work",
+                std::to_string(stats.validation_exact_row_entry_work));
+    PrintMetric("commit_validation_ms",
+                FormatDouble(stats.commit_validation_ms));
+    PrintMetric("audit_oracle_ms", FormatDouble(stats.audit_oracle_ms));
     PrintMetric("update_touched_quotient_entries",
                 std::to_string(stats.update_touched_quotient_entries));
     PrintMetric("quotient_nnz_final", std::to_string(stats.quotient_nnz_final));
@@ -1117,6 +1177,23 @@ int main(int argc, char** argv) {
       }
     }
 
+    if (!opts.commit_audit_csv.empty()) {
+      const std::vector<std::string> columns = {
+          "dataset", "commit_policy", "batch_id", "batch_size",
+          "partition_exact_cost", "cumulative_realized_gain",
+          "rejected_pair_count"};
+      const std::string dataset = DatasetLabelFromPath(opts.input);
+      for (const CommitAuditRow& row : sweg.commit_audit_rows()) {
+        AppendResultsCsv(
+            opts.commit_audit_csv, columns,
+            {dataset, CommitPolicyToString(opts.commit_policy),
+             std::to_string(row.batch_id), std::to_string(row.batch_size),
+             std::to_string(row.partition_exact_cost),
+             std::to_string(row.cumulative_realized_gain),
+             std::to_string(row.rejected_pair_count)});
+      }
+    }
+
     if (!opts.results_csv.empty()) {
       const std::vector<std::string> columns = {
           "n",
@@ -1136,6 +1213,7 @@ int main(int argc, char** argv) {
           "candidate_index",
           "candidate_budget",
           "certification",
+          "commit_policy",
           "validate_quotient",
           "quotient_update",
           "top_k",
@@ -1193,6 +1271,16 @@ int main(int argc, char** argv) {
           "merge_rejected_by_threshold",
           "merge_exact_gain_calls_per_selected",
           "merge_positive_gain_ratio",
+          "partition_hash",
+          "isolated_gain_sum", "realized_marginal_gain_sum",
+          "actual_batch_cost_reduction", "interaction_delta",
+          "selected_merges_for_validation",
+          "accepted_merges_after_validation", "rejected_nonpositive",
+          "stale_endpoint", "gain_decreased", "gain_increased",
+          "negative_marginal", "candidate_refresh_count",
+          "original_exact_calls", "validation_exact_calls",
+          "validation_exact_row_entry_work", "commit_validation_ms",
+          "audit_oracle_ms",
           "certification_candidates_seen",
           "upper_bound_pruned",
           "upper_bound_passed",
@@ -1265,6 +1353,7 @@ int main(int argc, char** argv) {
           CandidateIndexModeToString(opts.candidate_index_mode),
           std::to_string(opts.candidate_budget),
           CertificationModeToString(opts.certification_mode),
+          CommitPolicyToString(opts.commit_policy),
           opts.validate_quotient ? "true" : "false",
           QuotientUpdateModeToString(opts.quotient_update_mode),
           std::to_string(opts.top_k),
@@ -1322,6 +1411,24 @@ int main(int argc, char** argv) {
           std::to_string(stats.merge_rejected_by_threshold),
           FormatDouble(stats.merge_exact_gain_calls_per_selected),
           FormatDouble(stats.merge_positive_gain_ratio),
+          std::to_string(sweg.PartitionHash()),
+          std::to_string(stats.isolated_gain_sum),
+          std::to_string(stats.realized_marginal_gain_sum),
+          std::to_string(stats.actual_batch_cost_reduction),
+          std::to_string(stats.interaction_delta),
+          std::to_string(stats.selected_merges_for_validation),
+          std::to_string(stats.accepted_merges_after_validation),
+          std::to_string(stats.rejected_nonpositive),
+          std::to_string(stats.stale_endpoint),
+          std::to_string(stats.gain_decreased),
+          std::to_string(stats.gain_increased),
+          std::to_string(stats.negative_marginal),
+          std::to_string(stats.candidate_refresh_count),
+          std::to_string(stats.original_exact_calls),
+          std::to_string(stats.validation_exact_calls),
+          std::to_string(stats.validation_exact_row_entry_work),
+          FormatDouble(stats.commit_validation_ms),
+          FormatDouble(stats.audit_oracle_ms),
           std::to_string(stats.certification_candidates_seen),
           std::to_string(stats.upper_bound_pruned),
           std::to_string(stats.upper_bound_passed),
