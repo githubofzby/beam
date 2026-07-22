@@ -40,6 +40,30 @@ g++ -std=c++17 -O3 -Iinclude \
 
 ## 输入格式
 
+### CandidateIndex experimental path
+
+The Stage 3A proposal path is opt-in and currently requires persistent CPU
+state:
+
+```bash
+--candidate-index quotient-neighbor --candidate-budget 8
+```
+
+`--candidate-index legacy` remains the default reference. The
+quotient-neighbor prototype reads only quotient rows and uses direct neighbors,
+bounded shared-neighbor expansion, and one deterministic exploration proposal.
+It is retained for A/B evaluation but is not yet a recommended quality default.
+
+Stage 3B also provides the experimental residual path:
+
+```bash
+--candidate-index residual-signature --candidate-budget 4
+```
+
+Budget 4 is fixed to two residual proposals, one direct quotient neighbor, and
+one deterministic exploration proposal. This mode is diagnostic and is not a
+recommended default.
+
 程序只支持一种输入格式：
 
 - 普通文本无向 edge list
@@ -108,6 +132,24 @@ g++ -std=c++17 -O3 -Iinclude \
 
 - `--seed <int>`
   随机种子。默认 `1`。
+
+- `--profiling <off|summary|rounds>`
+  Stage 0 legacy instrumentation 模式。默认 `off`。`summary` 在运行结束时输出全局
+  漏斗与 work counters；`rounds` 还会保留每轮记录。
+
+- `--profile-csv <path>`
+  将每轮 profile 写入稳定的 long-form CSV。必须与 `--profiling rounds` 一起使用；
+  算法运行期间不会同步写盘。
+
+阶段 0 的完整 profiling 与 overhead runner 位于：
+
+```bash
+bash tools/run_stage0_profiling.sh ./build/beam
+bash tools/run_stage0_overhead.sh ./build/beam
+```
+
+两个脚本采用固定的 seven-dataset/four-dataset 参数集，并分别写入
+`docs/beam_x_stage0_profile_*.csv` 和 `docs/beam_x_stage0_overhead.csv`。
 
 - `--divide-hash-dims <int>`
   Adaptive Multi-Hash Divide 使用的独立 hash 维度数。默认 `16`。
@@ -673,6 +715,61 @@ done
 - `encoding_cost = |P| + |Cp| + |Cm|`
 - `cost_ratio = encoding_cost / original_edges_eval`
 - `compression_gain = 1 - cost_ratio`
+
+为与当前 MAGS 实现直接比较，BEAM 还报告一个仅影响评估的兼容指标。令
+`P_nonloop` 和 `P_loop` 分别为非自环和自环 superedge：
+
+- `cost_ratio_standard = (|P_nonloop| + |P_loop| + |Cp| + |Cm|) / m`
+- `cost_ratio_mags_compatible = (2|P_nonloop| + |P_loop| + 2|Cp| + 2|Cm|) / (2m)`
+- 等价地，`cost_ratio_mags_compatible = (|P_nonloop| + 0.5|P_loop| + |Cp| + |Cm|) / m`
+
+### Stage 1 CostOracle reference path
+
+默认的 `--cost-objective legacy` 保留上述历史 payload 统计和 merge 行为，便于与
+Stage 0 冻结基线 A/B 对照。Stage 1B 增加 CPU-only reference path：
+
+```bash
+beam --input graph.txt --scoring-backend cpu \
+  --cost-objective mags-compatible
+```
+
+该模式以整数 block objective
+`min(edges, 1 + capacity - edges)` 统一 exact merge、最终 partition cost 和
+encoding materialization。内部 block 的无向边与 correction 只物化一次，因此该模式
+输出的 `encoding_cost_mags_compatible` 为整数，并与 `exact_partition_cost` 完全相等。
+此 reference path 会在每次 commit 前从当前 partition 完整重算 merge gain；它用于
+Stage 1 correctness gate，不是性能实现。Stage 2 将用持久化 quotient state 替换这次
+完整重算。CUDA 暂不支持这一新 objective，显式请求会报错而不是混用 legacy kernel。
+
+### Stage 2 persistent quotient state
+
+Stage 2 提供独立 state backend，默认仍保留 legacy：
+
+```bash
+beam --input graph.txt --state-backend persistent \
+  --quotient-update auto
+```
+
+更新策略包括 `incremental`、`bulk_rebuild` 和 `auto`。`incremental` 使用 sorted
+flat quotient rows；`bulk_rebuild` 从当前 quotient edge stream 重聚合，不扫描原始
+图；`auto` 只有在单个 commit batch 减少至少 5% active supernodes 且估计增量工作
+超过当前 quotient NNZ 时才重建。当前 legacy scheduler 的 batch 较小，因此 auto
+通常选择 incremental。
+
+`--validate-quotient` 是小图/debug 开关，每次 commit 后从原图完整重建并核对状态和
+exact cost。它要求 persistent backend，不应在正式性能实验中启用。
+
+### Stage 4A safe certification
+
+`--certification safe` 为 persistent CPU MAGS-compatible 路径启用可证明安全的
+upper-bound pruning 和 threshold-aware exact early abort；默认值为 `off`。该模式
+要求 `--candidate-index legacy`，不改变候选顺序或 logical `merge_exact_gain_calls`。
+避免的 exact 工作使用 `exact_full_scan_count`、`exact_entries_scanned` 和
+`exact_entries_skipped` 统计。
+
+其中 `encoding_cost_mags_x2` 是上述兼容成本的两倍整数值，
+`encoding_cost_mags_compatible = encoding_cost_mags_x2 / 2`。该兼容指标只改变
+报告口径；不会改变 BEAM 的优化目标、分区或生成的 `P`、`Cp`、`Cm`。
 
 因此在当前唯一输入格式下：
 

@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "graph_io/graph.hpp"
+#include "candidate_index.hpp"
+#include "cost_oracle.hpp"
+#include "quotient_graph.hpp"
 
 struct EdgePair {
   int first = 0;
@@ -26,10 +29,152 @@ enum class ScoringBackend {
   kCuda,
 };
 
+enum class CostObjective {
+  kLegacy,
+  kMagsCompatible,
+};
+
+enum class StateBackend {
+  kLegacy,
+  kPersistent,
+};
+
+enum class QuotientUpdateMode {
+  kIncremental,
+  kBulkRebuild,
+  kAuto,
+};
+
+enum class CertificationMode {
+  kOff,
+  kSafe,
+};
+
 enum class ThresholdPolicy {
   kReciprocal,
   kMagsGeom,
   kAdaptive,
+};
+
+// Off avoids allocating or updating any per-iteration profiling state.
+enum class ProfilingMode {
+  kOff,
+  kSummary,
+  kRounds,
+};
+
+struct IterationProfile {
+  int iteration = 0;
+  int64_t active_supernodes = 0;
+  int64_t group_count = 0;
+  int64_t sum_group_sizes = 0;
+  uint64_t candidate_proxy_pairs_examined = 0;
+  uint64_t candidate_pairs_after_topk = 0;
+  uint64_t candidate_pairs_submitted_for_scoring = 0;
+  uint64_t candidate_pairs_scored = 0;
+  uint64_t exact_gain_calls = 0;
+  uint64_t exact_gain_positive_count = 0;
+  uint64_t above_threshold_count = 0;
+  uint64_t matching_selected_count = 0;
+  uint64_t actual_merge_count = 0;
+  uint64_t prepare_original_edges_scanned = 0;
+  uint64_t prepare_aggregated_nnz = 0;
+  uint64_t exact_gain_input_nnz = 0;
+  uint64_t update_partition_nodes_touched = 0;
+  uint64_t update_touched_quotient_entries = 0;
+  uint64_t prepare_row_entries_copied = 0;
+  uint64_t prepare_row_copy_bytes = 0;
+  uint64_t prepare_row_views_created = 0;
+  uint64_t prepare_unique_representatives = 0;
+  uint64_t prepare_row_acquisition_requests = 0;
+  uint64_t prepare_row_acquisition_hits = 0;
+  uint64_t prepare_row_acquisition_misses = 0;
+  uint64_t prepare_duplicate_acquisitions_avoided = 0;
+  uint64_t prepare_row_registry_entries = 0;
+  uint64_t prepare_row_registry_bytes = 0;
+  uint64_t exact_persistent_pairs = 0;
+  uint64_t exact_raw_entries_a = 0;
+  uint64_t exact_raw_entries_b = 0;
+  uint64_t exact_union_neighbors = 0;
+  uint64_t exact_overlap_neighbors = 0;
+  uint64_t exact_single_sided_neighbors = 0;
+  uint64_t exact_internal_block_terms = 0;
+  uint64_t exact_block_cost_evaluations = 0;
+  uint64_t exact_capacity_multiplications = 0;
+  double candidate_index_build_ms = 0.0;
+  double candidate_index_refresh_ms = 0.0;
+  double candidate_proposal_ms = 0.0;
+  uint64_t candidate_proposals_raw = 0;
+  uint64_t candidate_proposals_unique = 0;
+  uint64_t candidate_duplicates_removed = 0;
+  uint64_t candidate_budget_exhausted_nodes = 0;
+  uint64_t candidate_nodes_with_zero_proposals = 0;
+  uint64_t candidate_direct_neighbor_count = 0;
+  uint64_t candidate_shared_neighbor_count = 0;
+  uint64_t candidate_exploration_count = 0;
+  double residual_signature_build_ms = 0.0;
+  double residual_signature_refresh_ms = 0.0;
+  uint64_t residual_signature_rows_scanned = 0;
+  uint64_t residual_signature_features_created = 0;
+  uint64_t residual_signature_cache_hits = 0;
+  uint64_t residual_signature_cache_misses = 0;
+  uint64_t residual_bucket_count = 0;
+  uint64_t residual_bucket_max_size = 0;
+  uint64_t residual_bucket_candidates_considered = 0;
+  uint64_t residual_bucket_candidates_dropped_by_cap = 0;
+  int64_t residual_alignment_score_sum = 0;
+  int64_t residual_conflict_penalty_sum = 0;
+  int64_t residual_direct_score_sum = 0;
+  int64_t residual_size_compatibility_sum = 0;
+  uint64_t certification_candidates_seen = 0;
+  uint64_t upper_bound_pruned = 0;
+  uint64_t upper_bound_passed = 0;
+  uint64_t early_abort_count = 0;
+  uint64_t exact_full_scan_count = 0;
+  uint64_t exact_entries_available = 0;
+  uint64_t exact_entries_scanned = 0;
+  uint64_t exact_entries_skipped = 0;
+  double upper_bound_ms = 0.0;
+  double early_abort_exact_ms = 0.0;
+  double divide_ms = 0.0;
+  double prepare_ms = 0.0;
+  double candidate_discovery_task_sum_ms = 0.0;
+  double exact_gain_ms = 0.0;
+  double matching_ms = 0.0;
+  double update_ms = 0.0;
+  double quotient_row_lookup_ms = 0.0;
+  double quotient_row_copy_ms = 0.0;
+  double quotient_exact_gain_ms = 0.0;
+  double quotient_incremental_update_ms = 0.0;
+  double quotient_reciprocal_update_ms = 0.0;
+  double quotient_memory_allocation_ms = 0.0;
+  double quotient_sort_or_merge_ms = 0.0;
+  double quotient_rebuild_ms = 0.0;
+  uint64_t quotient_rows_updated = 0;
+  uint64_t quotient_entries_inserted = 0;
+  uint64_t quotient_entries_removed = 0;
+  uint64_t quotient_entries_shifted = 0;
+  uint64_t quotient_high_degree_rows_touched = 0;
+  uint64_t quotient_max_row_degree = 0;
+  uint64_t quotient_allocated_bytes = 0;
+  uint64_t quotient_peak_nnz = 0;
+};
+
+struct RuntimeProfile {
+  ProfilingMode mode = ProfilingMode::kOff;
+  int64_t iterations_observed = 0;
+  int64_t active_supernodes_last = 0;
+  int64_t group_count_last = 0;
+  int64_t sum_group_sizes_last = 0;
+  std::vector<IterationProfile> rounds;
+  IterationProfile current;
+  IterationProfile total;
+  double profiling_divide_ms = 0.0;
+  double profiling_prepare_ms = 0.0;
+  double profiling_candidate_discovery_task_sum_ms = 0.0;
+  double profiling_exact_gain_ms = 0.0;
+  double profiling_matching_ms = 0.0;
+  double profiling_update_ms = 0.0;
 };
 
 struct ThresholdConfig {
@@ -82,6 +227,80 @@ struct RuntimeStats {
   uint64_t merge_candidate_pairs_after_prune = 0;
   uint64_t merge_exact_gain_calls = 0;
   uint64_t merge_positive_gain_pairs = 0;
+  uint64_t update_touched_quotient_entries = 0;
+  uint64_t quotient_nnz_final = 0;
+  uint64_t quotient_incremental_batch_count = 0;
+  uint64_t quotient_bulk_rebuild_count = 0;
+  uint64_t prepare_row_entries_copied = 0;
+  uint64_t prepare_row_copy_bytes = 0;
+  uint64_t prepare_row_views_created = 0;
+  uint64_t prepare_unique_representatives = 0;
+  uint64_t prepare_row_acquisition_requests = 0;
+  uint64_t prepare_row_acquisition_hits = 0;
+  uint64_t prepare_row_acquisition_misses = 0;
+  uint64_t prepare_duplicate_acquisitions_avoided = 0;
+  uint64_t prepare_row_registry_entries = 0;
+  uint64_t prepare_row_registry_bytes = 0;
+  uint64_t exact_persistent_pairs = 0;
+  uint64_t exact_raw_entries_a = 0;
+  uint64_t exact_raw_entries_b = 0;
+  uint64_t exact_union_neighbors = 0;
+  uint64_t exact_overlap_neighbors = 0;
+  uint64_t exact_single_sided_neighbors = 0;
+  uint64_t exact_internal_block_terms = 0;
+  uint64_t exact_block_cost_evaluations = 0;
+  uint64_t exact_capacity_multiplications = 0;
+  double candidate_index_build_ms = 0.0;
+  double candidate_index_refresh_ms = 0.0;
+  double candidate_proposal_ms = 0.0;
+  uint64_t candidate_proposals_raw = 0;
+  uint64_t candidate_proposals_unique = 0;
+  uint64_t candidate_duplicates_removed = 0;
+  uint64_t candidate_budget_exhausted_nodes = 0;
+  uint64_t candidate_nodes_with_zero_proposals = 0;
+  uint64_t candidate_direct_neighbor_count = 0;
+  uint64_t candidate_shared_neighbor_count = 0;
+  uint64_t candidate_exploration_count = 0;
+  double residual_signature_build_ms = 0.0;
+  double residual_signature_refresh_ms = 0.0;
+  uint64_t residual_signature_rows_scanned = 0;
+  uint64_t residual_signature_features_created = 0;
+  uint64_t residual_signature_cache_hits = 0;
+  uint64_t residual_signature_cache_misses = 0;
+  uint64_t residual_bucket_count = 0;
+  uint64_t residual_bucket_max_size = 0;
+  uint64_t residual_bucket_candidates_considered = 0;
+  uint64_t residual_bucket_candidates_dropped_by_cap = 0;
+  int64_t residual_alignment_score_sum = 0;
+  int64_t residual_conflict_penalty_sum = 0;
+  int64_t residual_direct_score_sum = 0;
+  int64_t residual_size_compatibility_sum = 0;
+  uint64_t certification_candidates_seen = 0;
+  uint64_t upper_bound_pruned = 0;
+  uint64_t upper_bound_passed = 0;
+  uint64_t early_abort_count = 0;
+  uint64_t exact_full_scan_count = 0;
+  uint64_t exact_entries_available = 0;
+  uint64_t exact_entries_scanned = 0;
+  uint64_t exact_entries_skipped = 0;
+  double upper_bound_ms = 0.0;
+  double early_abort_exact_ms = 0.0;
+  double quotient_row_lookup_ms = 0.0;
+  double quotient_row_copy_ms = 0.0;
+  double quotient_exact_gain_ms = 0.0;
+  double quotient_incremental_update_ms = 0.0;
+  double quotient_reciprocal_update_ms = 0.0;
+  double quotient_memory_allocation_ms = 0.0;
+  double quotient_sort_or_merge_ms = 0.0;
+  double quotient_rebuild_ms = 0.0;
+  uint64_t quotient_rows_updated = 0;
+  uint64_t quotient_entries_inserted = 0;
+  uint64_t quotient_entries_removed = 0;
+  uint64_t quotient_entries_shifted = 0;
+  uint64_t quotient_high_degree_rows_touched = 0;
+  uint64_t quotient_max_row_degree = 0;
+  uint64_t quotient_allocated_bytes = 0;
+  uint64_t quotient_peak_nnz = 0;
   uint64_t merge_rejected_by_overlap = 0;
   uint64_t merge_rejected_by_threshold = 0;
   double merge_exact_gain_calls_per_selected = 0.0;
@@ -156,7 +375,18 @@ class Sweg {
                 int cuda_slice_memory_mb,
                 int overflow_group_gmax, int overflow_refine_rounds,
                 int divide_hash_dims, int divide_max_group,
-                const ThresholdConfig& threshold_config);
+                const ThresholdConfig& threshold_config,
+                ProfilingMode profiling_mode = ProfilingMode::kOff,
+                CostObjective cost_objective = CostObjective::kLegacy,
+                StateBackend state_backend = StateBackend::kLegacy,
+                bool validate_quotient = false,
+                QuotientUpdateMode quotient_update_mode =
+                    QuotientUpdateMode::kIncremental,
+                CandidateIndexMode candidate_index_mode =
+                    CandidateIndexMode::kLegacy,
+                int candidate_budget = 8,
+                CertificationMode certification_mode =
+                    CertificationMode::kOff);
 
   void Run(int iterations, int print_offset);
   void Divide(int iter);
@@ -171,14 +401,33 @@ class Sweg {
   int CountActiveSupernodes() const;
   int gstart() const { return gstart_; }
   const RuntimeStats& runtime_stats() const { return stats_; }
+  const RuntimeProfile& runtime_profile() const { return runtime_profile_; }
   const std::vector<int>& supernode_sizes_by_rep() const {
     return supernode_sizes_by_rep_;
   }
+  EncodingCost ExactCurrentPartitionCost() const;
   ~Sweg();
 
  private:
   struct CudaScoringCache;
   using SparseCounts = std::vector<std::pair<int, int64_t>>;
+
+  struct PreparedRow {
+    SparseCounts owned;
+    QuotientRowView view;
+
+    void SetOwned(SparseCounts row) {
+      owned = std::move(row);
+      view = QuotientRowView::Raw(owned.data(), owned.size());
+    }
+    void SetView(QuotientRowView row_view) {
+      owned.clear();
+      view = row_view;
+    }
+    size_t size() const { return view.size(); }
+    auto begin() const { return view.begin(); }
+    auto end() const { return view.end(); }
+  };
 
   struct GroupSpan {
     int start = 0;
@@ -194,9 +443,10 @@ class Sweg {
 
   struct EaGroupPrepared {
     std::vector<int> q;
-    std::vector<SparseCounts> agg_by_idx;
+    std::vector<PreparedRow> agg_by_idx;
     std::vector<int64_t> size_by_idx;
     std::vector<int64_t> self_loops_by_idx;
+    std::vector<EncodingCost> incident_cost_by_idx;
     std::vector<EaCandidatePair> candidate_pairs;
   };
 
@@ -219,6 +469,16 @@ class Sweg {
     uint64_t group_max_size = 0;
     uint64_t raw_pair_count = 0;
     uint64_t candidate_pairs_after_prune = 0;
+    uint64_t candidate_proxy_pairs_examined = 0;
+    uint64_t prepare_original_edges_scanned = 0;
+    uint64_t prepare_aggregated_nnz = 0;
+    uint64_t prepare_row_entries_copied = 0;
+    uint64_t prepare_row_copy_bytes = 0;
+    uint64_t prepare_row_views_created = 0;
+    double quotient_row_lookup_ms = 0.0;
+    double quotient_row_copy_ms = 0.0;
+    double candidate_proposal_ms = 0.0;
+    CandidateIndexStats candidate_index;
   };
 
   struct EaPrepareResult {
@@ -256,6 +516,11 @@ class Sweg {
 
   void ShuffleArray();
   void ResetRuntimeStats();
+  void RecordIterationProfile(int iter);
+  void FinalizeIterationProfile();
+  bool ProfilingEnabled() const {
+    return runtime_profile_.mode != ProfilingMode::kOff;
+  }
   int NodeShingle(int v) const;
   uint64_t HashRank64(int node, int dim, int iter) const;
   uint64_t DimRank(int dim, int iter) const;
@@ -316,21 +581,36 @@ class Sweg {
                                bool self_loop) const;
   int64_t EncodeCostForPair(int rep_u, int64_t size_u, int rep_x,
                             int64_t size_x, int64_t edges) const;
-  LocalGainResult ComputeLocalEncodingGain(const SparseCounts& agg_a,
-                                           const SparseCounts& agg_b, int rep_a,
+  LocalGainResult ComputeMagsCompatibleGain(
+      const QuotientRowView& agg_a, const QuotientRowView& agg_b, int rep_a,
+      int rep_b, int64_t size_a, int64_t size_b) const;
+  std::vector<int> CurrentPartitionLabels() const;
+  bool ValidateMergeAgainstCurrentPartition(int rep_a, int rep_b) const;
+  void CommitSelectedPairs(const std::vector<std::pair<int, int>>& pairs);
+  LocalGainResult ComputeLocalEncodingGain(const QuotientRowView& agg_a,
+                                           const QuotientRowView& agg_b, int rep_a,
                                            int rep_b, int64_t size_a,
                                            int64_t size_b,
                                            int64_t self_loops_a,
                                            int64_t self_loops_b) const;
-  FlatAggCSR BuildFlatAggCsr(const std::vector<SparseCounts>& agg_by_idx,
+  FlatAggCSR BuildFlatAggCsr(const std::vector<PreparedRow>& agg_by_idx,
                              const std::vector<int>& q,
                              const std::vector<int64_t>& size_by_idx,
                              const std::vector<int64_t>& self_loops_by_idx) const;
   std::vector<LocalGainResult> ScoreCandidatesCpu(
       const std::vector<std::pair<int, int>>& candidate_pairs,
-      const std::vector<SparseCounts>& agg_by_idx, const std::vector<int>& q,
+      const std::vector<PreparedRow>& agg_by_idx, const std::vector<int>& q,
       const std::vector<int64_t>& size_by_idx,
       const std::vector<int64_t>& self_loops_by_idx) const;
+  std::vector<LocalGainResult> ScoreCandidatesPersistentCpu(
+      const std::vector<std::pair<int, int>>& candidate_pairs,
+      const std::vector<int>& q, ExactGainWorkCounters* work) const;
+  std::vector<LocalGainResult> ScoreCandidatesCertifiedPersistentCpu(
+      const std::vector<std::pair<int, int>>& candidate_pairs,
+      const std::vector<int>& q,
+      const std::vector<EncodingCost>& incident_cost_by_idx,
+      double threshold, CertificationWorkCounters* work,
+      double* upper_bound_ms, double* exact_ms) const;
   std::vector<LocalGainResult> ScoreCandidatesCuda(
       const std::vector<std::pair<int, int>>& candidate_pairs,
       const FlatAggCSR& flat_agg, size_t candidate_chunk_size);
@@ -343,9 +623,14 @@ class Sweg {
   void EnsurePrepareWorkspace(PrepareWorkspace* workspace) const;
   void EnsurePrepareWorkspaces(int thread_count) const;
   void AccumulatePrepareStats(const EaPrepareStats& prepare_stats);
+  void RecordPreparedRowAcquisitionAudit(
+      const std::vector<std::vector<int>>& work_items);
+  void RefreshCandidateIndex(uint64_t epoch_seed);
+  void AccumulateCandidateIndexStats(const CandidateIndexStats& index_stats);
   SparseCounts CreateWForSupernodeWithScratch(
       int rep, ParallelScratch& scratch,
-      int64_t* self_loop_count = nullptr) const;
+      int64_t* self_loop_count = nullptr,
+      uint64_t* original_edges_scanned = nullptr) const;
   SparseCounts AggregateWBySupernodeWithScratch(
       const SparseCounts& w, ParallelScratch& scratch) const;
   size_t EstimateCudaSliceBytes(size_t total_rows, size_t total_nnz,
@@ -380,7 +665,20 @@ class Sweg {
   int divide_hash_dims_;
   int divide_max_group_;
   ThresholdConfig threshold_config_;
+  CostObjective cost_objective_;
+  CostOracle cost_oracle_;
+  StateBackend state_backend_;
+  bool validate_quotient_;
+  QuotientUpdateMode quotient_update_mode_;
+  CandidateIndexMode candidate_index_mode_ = CandidateIndexMode::kLegacy;
+  int candidate_budget_ = 8;
+  CertificationMode certification_mode_ = CertificationMode::kOff;
+  std::unique_ptr<CandidateIndex> candidate_index_;
+  bool candidate_index_built_ = false;
+  bool quotient_batch_precommitted_ = false;
+  std::unique_ptr<QuotientGraph> quotient_graph_;
   RuntimeStats stats_;
+  RuntimeProfile runtime_profile_;
   double threshold_acceptance_scale_ = 1.0;
   std::vector<double> prev_positive_savings_;
   std::vector<double> cur_positive_savings_;
@@ -398,8 +696,11 @@ class Sweg {
   mutable std::vector<int64_t> scratch_counts_;
   mutable std::vector<uint32_t> scratch_marks_;
   mutable std::vector<int> scratch_touched_;
+  std::vector<uint32_t> acquisition_audit_marks_;
+  uint32_t acquisition_audit_epoch_ = 1;
   mutable uint32_t scratch_epoch_ = 1;
   std::vector<int> active_reps_;
+  std::vector<int> candidate_active_reps_;
   std::vector<GroupSpan> groups_;
   std::vector<int> dim_order_;
   std::unordered_map<uint64_t, uint64_t> divide_minhash_cache_;

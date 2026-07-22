@@ -94,7 +94,12 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
            int cuda_slice_memory_mb,
            int overflow_group_gmax, int overflow_refine_rounds,
            int divide_hash_dims, int divide_max_group,
-           const ThresholdConfig& threshold_config)
+           const ThresholdConfig& threshold_config,
+           ProfilingMode profiling_mode, CostObjective cost_objective,
+           StateBackend state_backend, bool validate_quotient,
+           QuotientUpdateMode quotient_update_mode,
+           CandidateIndexMode candidate_index_mode, int candidate_budget,
+           CertificationMode certification_mode)
     : graph_(&graph),
       n_(graph.n),
       merge_mode_(merge_mode),
@@ -110,7 +115,15 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
       divide_hash_dims_(divide_hash_dims > 0 ? divide_hash_dims : 16),
       divide_max_group_(divide_max_group > 0 ? divide_max_group : 512),
       threshold_config_(threshold_config),
+      cost_objective_(cost_objective),
+      state_backend_(state_backend),
+      validate_quotient_(validate_quotient),
+      quotient_update_mode_(quotient_update_mode),
+      candidate_index_mode_(candidate_index_mode),
+      candidate_budget_(std::max(1, candidate_budget)),
+      certification_mode_(certification_mode),
       seed64_(seed) {
+  runtime_profile_.mode = profiling_mode;
   h_.resize(n_);
   S_.resize(n_);
   I_.resize(n_);
@@ -128,6 +141,7 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
   F_.assign(n_, -1);
   G_.resize(n_);
   active_reps_.reserve(n_);
+  candidate_active_reps_.reserve(n_);
   groups_.reserve(n_);
   dim_order_.reserve(static_cast<size_t>(divide_hash_dims_));
   rng_.seed(static_cast<uint32_t>(seed));
@@ -140,11 +154,187 @@ Sweg::Sweg(const CSRGraph& graph, MergeMode merge_mode, int top_k,
   scratch_counts_.assign(static_cast<size_t>(n_), 0);
   scratch_marks_.assign(static_cast<size_t>(n_), 0);
   scratch_touched_.reserve(static_cast<size_t>(std::min(n_, 1 << 20)));
+  if (profiling_mode != ProfilingMode::kOff) {
+    acquisition_audit_marks_.assign(static_cast<size_t>(n_), 0);
+  }
+  if (candidate_index_mode_ == CandidateIndexMode::kQuotientNeighbor) {
+    if (state_backend_ != StateBackend::kPersistent ||
+        scoring_backend_ != ScoringBackend::kCpu) {
+      throw std::invalid_argument(
+          "quotient-neighbor candidate index requires persistent CPU state");
+    }
+    candidate_index_ = std::make_unique<QuotientNeighborCandidateIndex>();
+  } else if (candidate_index_mode_ == CandidateIndexMode::kResidualSignature) {
+    if (state_backend_ != StateBackend::kPersistent ||
+        scoring_backend_ != ScoringBackend::kCpu) {
+      throw std::invalid_argument(
+          "residual-signature candidate index requires persistent CPU state");
+    }
+    candidate_index_ = std::make_unique<ResidualSignatureCandidateIndex>();
+  }
+  if (state_backend_ == StateBackend::kPersistent) {
+    quotient_graph_ = std::make_unique<QuotientGraph>(
+        graph, false, profiling_mode != ProfilingMode::kOff);
+  }
 }
 
 void Sweg::ResetRuntimeStats() {
   stats_ = RuntimeStats{};
   stats_.threshold_acceptance_scale = threshold_acceptance_scale_;
+  const ProfilingMode mode = runtime_profile_.mode;
+  runtime_profile_ = RuntimeProfile{};
+  runtime_profile_.mode = mode;
+}
+
+void Sweg::RecordIterationProfile(int iter) {
+  if (runtime_profile_.mode == ProfilingMode::kOff) {
+    return;
+  }
+
+  int64_t sum_group_sizes = 0;
+  for (const GroupSpan& group : groups_) {
+    sum_group_sizes += group.length;
+  }
+  runtime_profile_.current = IterationProfile{};
+  runtime_profile_.current.iteration = iter;
+  runtime_profile_.current.active_supernodes = active_reps_.size();
+  runtime_profile_.current.group_count = groups_.size();
+  runtime_profile_.current.sum_group_sizes = sum_group_sizes;
+}
+
+void Sweg::FinalizeIterationProfile() {
+  if (!ProfilingEnabled()) {
+    return;
+  }
+  const IterationProfile& profile = runtime_profile_.current;
+  runtime_profile_.iterations_observed += 1;
+  runtime_profile_.active_supernodes_last = profile.active_supernodes;
+  runtime_profile_.group_count_last = profile.group_count;
+  runtime_profile_.sum_group_sizes_last = profile.sum_group_sizes;
+  RuntimeProfile& runtime_profile = runtime_profile_;
+  runtime_profile.total.candidate_proxy_pairs_examined +=
+      profile.candidate_proxy_pairs_examined;
+  runtime_profile.total.candidate_pairs_after_topk +=
+      profile.candidate_pairs_after_topk;
+  runtime_profile.total.candidate_pairs_submitted_for_scoring +=
+      profile.candidate_pairs_submitted_for_scoring;
+  runtime_profile.total.candidate_pairs_scored += profile.candidate_pairs_scored;
+  runtime_profile.total.exact_gain_calls += profile.exact_gain_calls;
+  runtime_profile.total.exact_gain_positive_count +=
+      profile.exact_gain_positive_count;
+  runtime_profile.total.above_threshold_count += profile.above_threshold_count;
+  runtime_profile.total.matching_selected_count +=
+      profile.matching_selected_count;
+  runtime_profile.total.actual_merge_count += profile.actual_merge_count;
+  runtime_profile.total.prepare_original_edges_scanned +=
+      profile.prepare_original_edges_scanned;
+  runtime_profile.total.prepare_aggregated_nnz += profile.prepare_aggregated_nnz;
+  runtime_profile.total.exact_gain_input_nnz += profile.exact_gain_input_nnz;
+  runtime_profile.total.update_partition_nodes_touched +=
+      profile.update_partition_nodes_touched;
+  runtime_profile.total.update_touched_quotient_entries +=
+      profile.update_touched_quotient_entries;
+  runtime_profile.total.prepare_row_entries_copied +=
+      profile.prepare_row_entries_copied;
+  runtime_profile.total.prepare_row_copy_bytes += profile.prepare_row_copy_bytes;
+  runtime_profile.total.prepare_row_views_created +=
+      profile.prepare_row_views_created;
+  runtime_profile.total.prepare_unique_representatives +=
+      profile.prepare_unique_representatives;
+  runtime_profile.total.prepare_row_acquisition_requests +=
+      profile.prepare_row_acquisition_requests;
+  runtime_profile.total.prepare_row_acquisition_hits +=
+      profile.prepare_row_acquisition_hits;
+  runtime_profile.total.prepare_row_acquisition_misses +=
+      profile.prepare_row_acquisition_misses;
+  runtime_profile.total.prepare_duplicate_acquisitions_avoided +=
+      profile.prepare_duplicate_acquisitions_avoided;
+  runtime_profile.total.prepare_row_registry_entries = std::max(
+      runtime_profile.total.prepare_row_registry_entries,
+      profile.prepare_row_registry_entries);
+  runtime_profile.total.prepare_row_registry_bytes = std::max(
+      runtime_profile.total.prepare_row_registry_bytes,
+      profile.prepare_row_registry_bytes);
+  runtime_profile.total.exact_persistent_pairs += profile.exact_persistent_pairs;
+  runtime_profile.total.exact_raw_entries_a += profile.exact_raw_entries_a;
+  runtime_profile.total.exact_raw_entries_b += profile.exact_raw_entries_b;
+  runtime_profile.total.exact_union_neighbors += profile.exact_union_neighbors;
+  runtime_profile.total.exact_overlap_neighbors +=
+      profile.exact_overlap_neighbors;
+  runtime_profile.total.exact_single_sided_neighbors +=
+      profile.exact_single_sided_neighbors;
+  runtime_profile.total.exact_internal_block_terms +=
+      profile.exact_internal_block_terms;
+  runtime_profile.total.exact_block_cost_evaluations +=
+      profile.exact_block_cost_evaluations;
+  runtime_profile.total.exact_capacity_multiplications +=
+      profile.exact_capacity_multiplications;
+  runtime_profile.total.certification_candidates_seen +=
+      profile.certification_candidates_seen;
+  runtime_profile.total.upper_bound_pruned += profile.upper_bound_pruned;
+  runtime_profile.total.upper_bound_passed += profile.upper_bound_passed;
+  runtime_profile.total.early_abort_count += profile.early_abort_count;
+  runtime_profile.total.exact_full_scan_count += profile.exact_full_scan_count;
+  runtime_profile.total.exact_entries_available +=
+      profile.exact_entries_available;
+  runtime_profile.total.exact_entries_scanned += profile.exact_entries_scanned;
+  runtime_profile.total.exact_entries_skipped += profile.exact_entries_skipped;
+  runtime_profile.total.upper_bound_ms += profile.upper_bound_ms;
+  runtime_profile.total.early_abort_exact_ms += profile.early_abort_exact_ms;
+  runtime_profile.total.candidate_index_build_ms +=
+      profile.candidate_index_build_ms;
+  runtime_profile.total.candidate_index_refresh_ms +=
+      profile.candidate_index_refresh_ms;
+  runtime_profile.total.candidate_proposal_ms += profile.candidate_proposal_ms;
+  runtime_profile.total.candidate_proposals_raw +=
+      profile.candidate_proposals_raw;
+  runtime_profile.total.candidate_proposals_unique +=
+      profile.candidate_proposals_unique;
+  runtime_profile.total.candidate_duplicates_removed +=
+      profile.candidate_duplicates_removed;
+  runtime_profile.total.candidate_budget_exhausted_nodes +=
+      profile.candidate_budget_exhausted_nodes;
+  runtime_profile.total.candidate_nodes_with_zero_proposals +=
+      profile.candidate_nodes_with_zero_proposals;
+  runtime_profile.total.candidate_direct_neighbor_count +=
+      profile.candidate_direct_neighbor_count;
+  runtime_profile.total.candidate_shared_neighbor_count +=
+      profile.candidate_shared_neighbor_count;
+  runtime_profile.total.candidate_exploration_count +=
+      profile.candidate_exploration_count;
+  runtime_profile.total.residual_signature_build_ms +=
+      profile.residual_signature_build_ms;
+  runtime_profile.total.residual_signature_refresh_ms +=
+      profile.residual_signature_refresh_ms;
+  runtime_profile.total.residual_signature_rows_scanned +=
+      profile.residual_signature_rows_scanned;
+  runtime_profile.total.residual_signature_features_created +=
+      profile.residual_signature_features_created;
+  runtime_profile.total.residual_signature_cache_hits +=
+      profile.residual_signature_cache_hits;
+  runtime_profile.total.residual_signature_cache_misses +=
+      profile.residual_signature_cache_misses;
+  runtime_profile.total.residual_bucket_count += profile.residual_bucket_count;
+  runtime_profile.total.residual_bucket_max_size = std::max(
+      runtime_profile.total.residual_bucket_max_size,
+      profile.residual_bucket_max_size);
+  runtime_profile.total.residual_bucket_candidates_considered +=
+      profile.residual_bucket_candidates_considered;
+  runtime_profile.total.residual_bucket_candidates_dropped_by_cap +=
+      profile.residual_bucket_candidates_dropped_by_cap;
+  runtime_profile.total.quotient_row_lookup_ms += profile.quotient_row_lookup_ms;
+  runtime_profile.total.quotient_row_copy_ms += profile.quotient_row_copy_ms;
+  runtime_profile.total.quotient_exact_gain_ms += profile.quotient_exact_gain_ms;
+  runtime_profile.profiling_divide_ms += profile.divide_ms;
+  runtime_profile.profiling_prepare_ms += profile.prepare_ms;
+  runtime_profile.profiling_candidate_discovery_task_sum_ms +=
+      profile.candidate_discovery_task_sum_ms;
+  runtime_profile.profiling_exact_gain_ms += profile.exact_gain_ms;
+  runtime_profile.profiling_matching_ms += profile.matching_ms;
+  runtime_profile.profiling_update_ms += profile.update_ms;
+  if (runtime_profile_.mode == ProfilingMode::kRounds) {
+    runtime_profile_.rounds.push_back(profile);
+  }
 }
 
 double Sweg::GeometricThreshold(int iter, int total_iterations) const {
@@ -338,6 +528,109 @@ void Sweg::AccumulatePrepareStats(const EaPrepareStats& prepare_stats) {
   stats_.merge_raw_pair_count += prepare_stats.raw_pair_count;
   stats_.merge_candidate_pairs_after_prune +=
       prepare_stats.candidate_pairs_after_prune;
+  stats_.prepare_row_entries_copied += prepare_stats.prepare_row_entries_copied;
+  stats_.prepare_row_copy_bytes += prepare_stats.prepare_row_copy_bytes;
+  stats_.prepare_row_views_created += prepare_stats.prepare_row_views_created;
+  stats_.quotient_row_lookup_ms += prepare_stats.quotient_row_lookup_ms;
+  stats_.quotient_row_copy_ms += prepare_stats.quotient_row_copy_ms;
+  stats_.candidate_proposal_ms += prepare_stats.candidate_proposal_ms;
+  stats_.candidate_proposals_raw +=
+      prepare_stats.candidate_index.proposals_raw;
+  stats_.candidate_proposals_unique +=
+      prepare_stats.candidate_index.proposals_unique;
+  stats_.candidate_duplicates_removed +=
+      prepare_stats.candidate_index.duplicates_removed;
+  stats_.candidate_budget_exhausted_nodes +=
+      prepare_stats.candidate_index.budget_exhausted_nodes;
+  stats_.candidate_nodes_with_zero_proposals +=
+      prepare_stats.candidate_index.nodes_with_zero_proposals;
+  stats_.candidate_direct_neighbor_count +=
+      prepare_stats.candidate_index.direct_neighbor_count;
+  stats_.candidate_shared_neighbor_count +=
+      prepare_stats.candidate_index.shared_neighbor_count;
+  stats_.candidate_exploration_count +=
+      prepare_stats.candidate_index.exploration_count;
+  AccumulateCandidateIndexStats(prepare_stats.candidate_index);
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.prepare_row_entries_copied +=
+        prepare_stats.prepare_row_entries_copied;
+    runtime_profile_.current.prepare_row_copy_bytes +=
+        prepare_stats.prepare_row_copy_bytes;
+    runtime_profile_.current.prepare_row_views_created +=
+        prepare_stats.prepare_row_views_created;
+    runtime_profile_.current.quotient_row_lookup_ms +=
+        prepare_stats.quotient_row_lookup_ms;
+    runtime_profile_.current.quotient_row_copy_ms +=
+        prepare_stats.quotient_row_copy_ms;
+    runtime_profile_.current.candidate_proposal_ms +=
+        prepare_stats.candidate_proposal_ms;
+    runtime_profile_.current.candidate_proposals_raw +=
+        prepare_stats.candidate_index.proposals_raw;
+    runtime_profile_.current.candidate_proposals_unique +=
+        prepare_stats.candidate_index.proposals_unique;
+    runtime_profile_.current.candidate_duplicates_removed +=
+        prepare_stats.candidate_index.duplicates_removed;
+    runtime_profile_.current.candidate_budget_exhausted_nodes +=
+        prepare_stats.candidate_index.budget_exhausted_nodes;
+    runtime_profile_.current.candidate_nodes_with_zero_proposals +=
+        prepare_stats.candidate_index.nodes_with_zero_proposals;
+    runtime_profile_.current.candidate_direct_neighbor_count +=
+        prepare_stats.candidate_index.direct_neighbor_count;
+    runtime_profile_.current.candidate_shared_neighbor_count +=
+        prepare_stats.candidate_index.shared_neighbor_count;
+    runtime_profile_.current.candidate_exploration_count +=
+        prepare_stats.candidate_index.exploration_count;
+    runtime_profile_.current.candidate_discovery_task_sum_ms +=
+        prepare_stats.candidate_gen_ms;
+    runtime_profile_.current.candidate_proxy_pairs_examined +=
+        prepare_stats.candidate_proxy_pairs_examined;
+    runtime_profile_.current.candidate_pairs_after_topk +=
+        prepare_stats.candidate_pairs_after_prune;
+    runtime_profile_.current.prepare_original_edges_scanned +=
+        prepare_stats.prepare_original_edges_scanned;
+    runtime_profile_.current.prepare_aggregated_nnz +=
+        prepare_stats.prepare_aggregated_nnz;
+  }
+}
+
+void Sweg::RecordPreparedRowAcquisitionAudit(
+    const std::vector<std::vector<int>>& work_items) {
+  if (!ProfilingEnabled() || state_backend_ != StateBackend::kPersistent) {
+    return;
+  }
+  if (++acquisition_audit_epoch_ == 0) {
+    std::fill(acquisition_audit_marks_.begin(), acquisition_audit_marks_.end(),
+              0);
+    acquisition_audit_epoch_ = 1;
+  }
+  uint64_t requests = 0;
+  uint64_t unique = 0;
+  for (const std::vector<int>& item : work_items) {
+    for (int rep : item) {
+      if (rep < 0 || rep >= n_ || I_[rep] == -1) {
+        continue;
+      }
+      ++requests;
+      uint32_t& mark = acquisition_audit_marks_[static_cast<size_t>(rep)];
+      if (mark != acquisition_audit_epoch_) {
+        mark = acquisition_audit_epoch_;
+        ++unique;
+      }
+    }
+  }
+  const uint64_t hits = requests - unique;
+  IterationProfile& profile = runtime_profile_.current;
+  profile.prepare_unique_representatives += unique;
+  profile.prepare_row_acquisition_requests += requests;
+  profile.prepare_row_acquisition_hits += hits;
+  profile.prepare_row_acquisition_misses += unique;
+  profile.prepare_duplicate_acquisitions_avoided += hits;
+
+  stats_.prepare_unique_representatives += unique;
+  stats_.prepare_row_acquisition_requests += requests;
+  stats_.prepare_row_acquisition_hits += hits;
+  stats_.prepare_row_acquisition_misses += unique;
+  stats_.prepare_duplicate_acquisitions_avoided += hits;
 }
 
 void Sweg::Run(int iterations, int print_offset) {
@@ -350,11 +643,16 @@ void Sweg::Run(int iterations, int print_offset) {
     Divide(iter);
     const auto divide_end = std::chrono::steady_clock::now();
     stats_.runtime_divide_ms += ElapsedMs(divide_start, divide_end);
+    RecordIterationProfile(iter);
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.divide_ms = ElapsedMs(divide_start, divide_end);
+    }
 
     const auto merge_start = std::chrono::steady_clock::now();
     Merge(iter, iterations);
     const auto merge_end = std::chrono::steady_clock::now();
     stats_.runtime_merge_ms += ElapsedMs(merge_start, merge_end);
+    FinalizeIterationProfile();
 
     if (print_offset > 0 &&
         (iter % print_offset == 0 || iter == iterations)) {
@@ -370,6 +668,29 @@ void Sweg::Run(int iterations, int print_offset) {
   stats_.merge_positive_gain_ratio =
       SafeRatio(stats_.merge_positive_gain_pairs,
                 std::max<uint64_t>(1, stats_.merge_exact_gain_calls));
+  if (quotient_graph_ != nullptr) {
+    quotient_graph_->FinalizeProfileSnapshot();
+    stats_.quotient_nnz_final = quotient_graph_->Nnz();
+    const QuotientProfileStats& quotient_profile =
+        quotient_graph_->profile_stats();
+    stats_.quotient_incremental_update_ms =
+        quotient_profile.incremental_update_ms;
+    stats_.quotient_reciprocal_update_ms =
+        quotient_profile.reciprocal_update_ms;
+    stats_.quotient_memory_allocation_ms =
+        quotient_profile.memory_allocation_ms;
+    stats_.quotient_sort_or_merge_ms = quotient_profile.sort_or_merge_ms;
+    stats_.quotient_rebuild_ms = quotient_profile.rebuild_ms;
+    stats_.quotient_rows_updated = quotient_profile.rows_updated;
+    stats_.quotient_entries_inserted = quotient_profile.entries_inserted;
+    stats_.quotient_entries_removed = quotient_profile.entries_removed;
+    stats_.quotient_entries_shifted = quotient_profile.entries_shifted;
+    stats_.quotient_high_degree_rows_touched =
+        quotient_profile.high_degree_rows_touched;
+    stats_.quotient_max_row_degree = quotient_profile.max_row_degree;
+    stats_.quotient_allocated_bytes = quotient_profile.allocated_bytes;
+    stats_.quotient_peak_nnz = quotient_profile.peak_quotient_nnz;
+  }
 }
 
 void Sweg::ShuffleArray() {
@@ -564,22 +885,39 @@ Sweg::SparseCounts Sweg::CreateWForSupernode(int rep,
 }
 
 Sweg::SparseCounts Sweg::CreateWForSupernodeWithScratch(
-    int rep, ParallelScratch& scratch, int64_t* self_loop_count) const {
+    int rep, ParallelScratch& scratch, int64_t* self_loop_count,
+    uint64_t* original_edges_scanned) const {
   ResetParallelScratch(scratch);
   int64_t loop_count = 0;
 
   for (int node = I_[rep]; node != -1; node = J_[node]) {
     auto neighbors = graph_->neighbors(node);
-    for (const int* it = neighbors.first; it != neighbors.second; ++it) {
-      const int neighbor = *it;
-      if (scratch.marks[static_cast<size_t>(neighbor)] != scratch.epoch) {
-        scratch.marks[static_cast<size_t>(neighbor)] = scratch.epoch;
-        scratch.counts[static_cast<size_t>(neighbor)] = 0;
-        scratch.touched.push_back(neighbor);
+    if (original_edges_scanned != nullptr) {
+      for (const int* it = neighbors.first; it != neighbors.second; ++it) {
+        ++*original_edges_scanned;
+        const int neighbor = *it;
+        if (scratch.marks[static_cast<size_t>(neighbor)] != scratch.epoch) {
+          scratch.marks[static_cast<size_t>(neighbor)] = scratch.epoch;
+          scratch.counts[static_cast<size_t>(neighbor)] = 0;
+          scratch.touched.push_back(neighbor);
+        }
+        ++scratch.counts[static_cast<size_t>(neighbor)];
+        if (*it == node) {
+          ++loop_count;
+        }
       }
-      ++scratch.counts[static_cast<size_t>(neighbor)];
-      if (*it == node) {
-        ++loop_count;
+    } else {
+      for (const int* it = neighbors.first; it != neighbors.second; ++it) {
+        const int neighbor = *it;
+        if (scratch.marks[static_cast<size_t>(neighbor)] != scratch.epoch) {
+          scratch.marks[static_cast<size_t>(neighbor)] = scratch.epoch;
+          scratch.counts[static_cast<size_t>(neighbor)] = 0;
+          scratch.touched.push_back(neighbor);
+        }
+        ++scratch.counts[static_cast<size_t>(neighbor)];
+        if (*it == node) {
+          ++loop_count;
+        }
       }
     }
   }
@@ -599,6 +937,7 @@ Sweg::SparseCounts Sweg::CreateWForSupernodeWithScratch(
 
 void Sweg::Merge(int iter, int total_iterations) {
   BeginMergeIteration();
+  RefreshCandidateIndex(seed64_ ^ static_cast<uint64_t>(iter));
   const auto groups = BuildGroups();
   const double threshold = ComputeMergeThreshold(iter, total_iterations);
   OverflowRefineCounters overflow_counters;
@@ -628,6 +967,10 @@ void Sweg::Merge(int iter, int total_iterations) {
             : 0;
     for (size_t block_start = 0; block_start < groups.size();
          block_start += static_cast<size_t>(block_size)) {
+      if (block_start != 0) {
+        RefreshCandidateIndex(seed64_ ^ static_cast<uint64_t>(iter) ^
+                              static_cast<uint64_t>(block_start));
+      }
       const size_t block_end =
           std::min(groups.size(), block_start + static_cast<size_t>(block_size));
       std::vector<std::pair<int, int>> block_selected_pairs;
@@ -643,6 +986,7 @@ void Sweg::Merge(int iter, int total_iterations) {
 
       std::vector<EaGroupPrepared> prepared_groups(work_items.size());
       std::vector<EaPrepareStats> prepare_stats(work_items.size());
+      RecordPreparedRowAcquisitionAudit(work_items);
       if (!work_items.empty()) {
         const auto prepare_start = std::chrono::steady_clock::now();
 #ifdef _OPENMP
@@ -672,10 +1016,39 @@ void Sweg::Merge(int iter, int total_iterations) {
 #endif
         stats_.merge_prepare_wall_ms +=
             ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+        if (ProfilingEnabled()) {
+          runtime_profile_.current.prepare_ms +=
+              ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+        }
       }
 
       for (size_t i = 0; i < prepare_stats.size(); ++i) {
         AccumulatePrepareStats(prepare_stats[i]);
+      }
+      if (candidate_index_mode_ != CandidateIndexMode::kLegacy) {
+        std::unordered_set<uint64_t> seen_pairs;
+        for (EaGroupPrepared& prepared : prepared_groups) {
+          std::vector<EaCandidatePair> unique;
+          unique.reserve(prepared.candidate_pairs.size());
+          for (const EaCandidatePair& pair : prepared.candidate_pairs) {
+            const uint32_t rep_a = static_cast<uint32_t>(
+                prepared.q[static_cast<size_t>(pair.a_idx)]);
+            const uint32_t rep_b = static_cast<uint32_t>(
+                prepared.q[static_cast<size_t>(pair.b_idx)]);
+            const uint32_t lo = std::min(rep_a, rep_b);
+            const uint32_t hi = std::max(rep_a, rep_b);
+            const uint64_t key = (static_cast<uint64_t>(lo) << 32U) | hi;
+            if (seen_pairs.insert(key).second) {
+              unique.push_back(pair);
+            } else {
+              ++stats_.candidate_duplicates_removed;
+              if (ProfilingEnabled()) {
+                ++runtime_profile_.current.candidate_duplicates_removed;
+              }
+            }
+          }
+          prepared.candidate_pairs.swap(unique);
+        }
       }
 
       std::vector<CudaSliceSpan> slice_plan;
@@ -719,16 +1092,13 @@ void Sweg::Merge(int iter, int total_iterations) {
       }
 
       const auto update_start = std::chrono::steady_clock::now();
-      for (const auto& pair : block_selected_pairs) {
-        const int rep_a = pair.first;
-        const int rep_b = pair.second;
-        if (I_[rep_a] == -1 || I_[rep_b] == -1) {
-          continue;
-        }
-        Update_S(rep_a, rep_b);
-      }
+      CommitSelectedPairs(block_selected_pairs);
       const auto update_end = std::chrono::steady_clock::now();
-      stats_.merge_update_ms += ElapsedMs(update_start, update_end);
+      const double update_ms = ElapsedMs(update_start, update_end);
+      stats_.merge_update_ms += update_ms;
+      if (ProfilingEnabled()) {
+        runtime_profile_.current.update_ms += update_ms;
+      }
     }
     if (overflow_counters.overflow_groups_seen > 0) {
       std::cout << "  Overflow refinement: groups="
@@ -762,6 +1132,9 @@ void Sweg::Merge(int iter, int total_iterations) {
   for (const GroupSpan& group : groups) {
     const auto refined_groups = build_refined_group_list(group);
     for (const auto& q : refined_groups) {
+      if (ProfilingEnabled()) {
+        RecordPreparedRowAcquisitionAudit({q});
+      }
       switch (merge_mode_) {
         case MergeMode::kBatchEncodingAware:
           MergeBatchEncodingAwareGroup(q, threshold);
@@ -791,6 +1164,68 @@ void Sweg::Merge(int iter, int total_iterations) {
                  overflow_counters.max_group_after);
   }
   EndMergeIteration();
+}
+
+void Sweg::RefreshCandidateIndex(uint64_t epoch_seed) {
+  if (candidate_index_ == nullptr) return;
+  candidate_active_reps_.clear();
+  for (int rep = 0; rep < n_; ++rep) {
+    if (I_[rep] != -1 && quotient_graph_->IsActive(rep)) {
+      candidate_active_reps_.push_back(rep);
+    }
+  }
+  const auto start = std::chrono::steady_clock::now();
+  candidate_index_->BuildOrRefresh(*quotient_graph_, candidate_active_reps_,
+                                   epoch_seed);
+  CandidateIndexStats refresh_stats;
+  candidate_index_->CollectRefreshStats(&refresh_stats);
+  AccumulateCandidateIndexStats(refresh_stats);
+  const double elapsed = ElapsedMs(start, std::chrono::steady_clock::now());
+  if (!candidate_index_built_) {
+    stats_.candidate_index_build_ms += elapsed;
+    if (ProfilingEnabled()) runtime_profile_.current.candidate_index_build_ms += elapsed;
+    candidate_index_built_ = true;
+  } else {
+    stats_.candidate_index_refresh_ms += elapsed;
+    if (ProfilingEnabled()) runtime_profile_.current.candidate_index_refresh_ms += elapsed;
+  }
+}
+
+void Sweg::AccumulateCandidateIndexStats(
+    const CandidateIndexStats& index_stats) {
+  stats_.residual_signature_build_ms += index_stats.residual_signature_build_ms;
+  stats_.residual_signature_refresh_ms += index_stats.residual_signature_refresh_ms;
+  stats_.residual_signature_rows_scanned += index_stats.residual_signature_rows_scanned;
+  stats_.residual_signature_features_created += index_stats.residual_signature_features_created;
+  stats_.residual_signature_cache_hits += index_stats.residual_signature_cache_hits;
+  stats_.residual_signature_cache_misses += index_stats.residual_signature_cache_misses;
+  stats_.residual_bucket_count += index_stats.residual_bucket_count;
+  stats_.residual_bucket_max_size = std::max(stats_.residual_bucket_max_size,
+                                            index_stats.residual_bucket_max_size);
+  stats_.residual_bucket_candidates_considered += index_stats.residual_bucket_candidates_considered;
+  stats_.residual_bucket_candidates_dropped_by_cap += index_stats.residual_bucket_candidates_dropped_by_cap;
+  stats_.residual_alignment_score_sum += index_stats.residual_alignment_score_sum;
+  stats_.residual_conflict_penalty_sum += index_stats.residual_conflict_penalty_sum;
+  stats_.residual_direct_score_sum += index_stats.residual_direct_score_sum;
+  stats_.residual_size_compatibility_sum += index_stats.residual_size_compatibility_sum;
+  if (ProfilingEnabled()) {
+    IterationProfile& profile = runtime_profile_.current;
+    profile.residual_signature_build_ms += index_stats.residual_signature_build_ms;
+    profile.residual_signature_refresh_ms += index_stats.residual_signature_refresh_ms;
+    profile.residual_signature_rows_scanned += index_stats.residual_signature_rows_scanned;
+    profile.residual_signature_features_created += index_stats.residual_signature_features_created;
+    profile.residual_signature_cache_hits += index_stats.residual_signature_cache_hits;
+    profile.residual_signature_cache_misses += index_stats.residual_signature_cache_misses;
+    profile.residual_bucket_count += index_stats.residual_bucket_count;
+    profile.residual_bucket_max_size = std::max(profile.residual_bucket_max_size,
+                                                index_stats.residual_bucket_max_size);
+    profile.residual_bucket_candidates_considered += index_stats.residual_bucket_candidates_considered;
+    profile.residual_bucket_candidates_dropped_by_cap += index_stats.residual_bucket_candidates_dropped_by_cap;
+    profile.residual_alignment_score_sum += index_stats.residual_alignment_score_sum;
+    profile.residual_conflict_penalty_sum += index_stats.residual_conflict_penalty_sum;
+    profile.residual_direct_score_sum += index_stats.residual_direct_score_sum;
+    profile.residual_size_compatibility_sum += index_stats.residual_size_compatibility_sum;
+  }
 }
 
 Sweg::SparseCounts Sweg::AggregateWBySupernode(const SparseCounts& w) const {
@@ -881,7 +1316,7 @@ std::vector<Sweg::CudaSliceSpan> Sweg::BuildCudaSlicePlan(
     const EaGroupPrepared& group = prepared_groups[i];
     group_rows[i] = group.q.size();
     group_candidates[i] = group.candidate_pairs.size();
-    for (const SparseCounts& row : group.agg_by_idx) {
+    for (const PreparedRow& row : group.agg_by_idx) {
       group_nnz[i] += row.size();
     }
     total_rows += group_rows[i];
@@ -981,13 +1416,85 @@ int64_t Sweg::EncodeCostForPair(int rep_u, int64_t size_u, int rep_x,
   return std::min(edges, complement_cost);
 }
 
-Sweg::LocalGainResult Sweg::ComputeLocalEncodingGain(const SparseCounts& agg_a,
-                                                     const SparseCounts& agg_b,
+Sweg::LocalGainResult Sweg::ComputeMagsCompatibleGain(
+    const QuotientRowView& agg_a, const QuotientRowView& agg_b, int rep_a,
+    int rep_b,
+    int64_t size_a, int64_t size_b) const {
+  const auto edge_count = [](const QuotientRowView& row, int target) {
+    for (const auto entry : row) {
+      if (entry.first == target) return entry.second;
+      if (entry.first > target) break;
+    }
+    return int64_t{0};
+  };
+
+  const int64_t edges_aa_raw = edge_count(agg_a, rep_a);
+  const int64_t edges_bb_raw = edge_count(agg_b, rep_b);
+  if ((edges_aa_raw & 1) != 0 || (edges_bb_raw & 1) != 0) {
+    throw std::runtime_error("Internal CSR arc count must be even");
+  }
+  const int64_t edges_aa = edges_aa_raw / 2;
+  const int64_t edges_bb = edges_bb_raw / 2;
+  const int64_t edges_ab_a = edge_count(agg_a, rep_b);
+  const int64_t edges_ab_b = edge_count(agg_b, rep_a);
+  if (edges_ab_a != edges_ab_b) {
+    throw std::runtime_error("Asymmetric quotient edge count during scoring");
+  }
+
+  int64_t before = 0;
+  int64_t after = 0;
+  before += cost_oracle_.BlockCost(size_a, size_a, edges_aa, true);
+  before += cost_oracle_.BlockCost(size_b, size_b, edges_bb, true);
+  before += cost_oracle_.BlockCost(size_a, size_b, edges_ab_a, false);
+  after += cost_oracle_.BlockCost(size_a + size_b, size_a + size_b,
+                                  edges_aa + edges_bb + edges_ab_a, true);
+
+  size_t ia = 0;
+  size_t ib = 0;
+  while (ia < agg_a.size() || ib < agg_b.size()) {
+    int rep_x = -1;
+    int64_t edges_a = 0;
+    int64_t edges_b = 0;
+    if (ib >= agg_b.size() ||
+        (ia < agg_a.size() && agg_a[ia].first < agg_b[ib].first)) {
+      rep_x = agg_a[ia].first;
+      edges_a = agg_a[ia].second;
+      ++ia;
+    } else if (ia >= agg_a.size() || agg_b[ib].first < agg_a[ia].first) {
+      rep_x = agg_b[ib].first;
+      edges_b = agg_b[ib].second;
+      ++ib;
+    } else {
+      rep_x = agg_a[ia].first;
+      edges_a = agg_a[ia].second;
+      edges_b = agg_b[ib].second;
+      ++ia;
+      ++ib;
+    }
+    if (rep_x == rep_a || rep_x == rep_b) {
+      continue;
+    }
+    const int64_t size_x = supernode_sizes_by_rep_[static_cast<size_t>(rep_x)];
+    before += cost_oracle_.BlockCost(size_a, size_x, edges_a, false);
+    before += cost_oracle_.BlockCost(size_b, size_x, edges_b, false);
+    after += cost_oracle_.BlockCost(size_a + size_b, size_x,
+                                    edges_a + edges_b, false);
+  }
+  return LocalGainResult{before - after, before};
+}
+
+Sweg::LocalGainResult Sweg::ComputeLocalEncodingGain(
+                                                     const QuotientRowView& agg_a,
+                                                     const QuotientRowView& agg_b,
                                                      int rep_a, int rep_b,
                                                      int64_t size_a,
                                                      int64_t size_b,
                                                      int64_t self_loops_a,
                                                      int64_t self_loops_b) const {
+  if (cost_objective_ == CostObjective::kMagsCompatible) {
+    return ComputeMagsCompatibleGain(agg_a, agg_b, rep_a, rep_b, size_a,
+                                     size_b);
+  }
   const int64_t size_m = size_a + size_b;
 
   int64_t before_total = 0;
@@ -1066,6 +1573,9 @@ Sweg::EaGroupPrepared Sweg::PrepareBatchEncodingAwareGroup(
   EaPrepareResult result = PrepareBatchEncodingAwareGroupWithWorkspace(
       q, &sequential_prepare_workspace_, true);
   AccumulatePrepareStats(result.stats);
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.prepare_ms += result.stats.wall_ms;
+  }
   return std::move(result.prepared);
 }
 
@@ -1097,6 +1607,16 @@ Sweg::EaPrepareResult Sweg::PrepareBatchEncodingAwareGroupWithWorkspace(
   result.prepared.agg_by_idx.resize(static_cast<size_t>(group_size));
   result.prepared.self_loops_by_idx.assign(static_cast<size_t>(group_size), 0);
   result.prepared.size_by_idx.assign(static_cast<size_t>(group_size), 0);
+  if (state_backend_ == StateBackend::kPersistent &&
+      certification_mode_ == CertificationMode::kSafe) {
+    result.prepared.incident_cost_by_idx.assign(
+        static_cast<size_t>(group_size), 0);
+  }
+  std::vector<uint64_t> original_edges_scanned_by_idx;
+  if (ProfilingEnabled()) {
+    original_edges_scanned_by_idx.assign(static_cast<size_t>(group_size), 0);
+  }
+  const bool use_persistent = state_backend_ == StateBackend::kPersistent;
   const bool use_parallel_create = allow_inner_parallel && group_size >= 64;
 #ifdef _OPENMP
   if (use_parallel_create) {
@@ -1108,15 +1628,29 @@ Sweg::EaPrepareResult Sweg::PrepareBatchEncodingAwareGroupWithWorkspace(
       if (I_[rep] == -1) {
         continue;
       }
+      if (use_persistent) {
+        result.prepared.agg_by_idx[static_cast<size_t>(i)].SetView(
+            quotient_graph_->GetRowView(rep));
+        result.prepared.size_by_idx[static_cast<size_t>(i)] =
+            quotient_graph_->GetSize(rep);
+        if (!result.prepared.incident_cost_by_idx.empty()) {
+          result.prepared.incident_cost_by_idx[static_cast<size_t>(i)] =
+              quotient_graph_->ExactIncidentCost(rep);
+        }
+        continue;
+      }
       const int tid = omp_get_thread_num();
       PrepareWorkspace& ws = prepare_workspaces_[static_cast<size_t>(tid)];
       w_by_idx[static_cast<size_t>(i)] =
           CreateWForSupernodeWithScratch(
               rep, ws.scratch,
-              &result.prepared.self_loops_by_idx[static_cast<size_t>(i)]);
-      result.prepared.agg_by_idx[static_cast<size_t>(i)] =
+              &result.prepared.self_loops_by_idx[static_cast<size_t>(i)],
+              ProfilingEnabled()
+                  ? &original_edges_scanned_by_idx[static_cast<size_t>(i)]
+                  : nullptr);
+      result.prepared.agg_by_idx[static_cast<size_t>(i)].SetOwned(
           AggregateWBySupernodeWithScratch(w_by_idx[static_cast<size_t>(i)],
-                                           ws.scratch);
+                                           ws.scratch));
       result.prepared.size_by_idx[static_cast<size_t>(i)] = static_cast<int64_t>(
           supernode_sizes_by_rep_[static_cast<size_t>(rep)]);
     }
@@ -1126,23 +1660,127 @@ Sweg::EaPrepareResult Sweg::PrepareBatchEncodingAwareGroupWithWorkspace(
     for (int i = 0; i < group_size; ++i) {
       const int rep = result.prepared.q[static_cast<size_t>(i)];
       if (I_[rep] != -1) {
+        if (use_persistent) {
+          result.prepared.agg_by_idx[static_cast<size_t>(i)].SetView(
+              quotient_graph_->GetRowView(rep));
+          result.prepared.size_by_idx[static_cast<size_t>(i)] =
+              quotient_graph_->GetSize(rep);
+          if (!result.prepared.incident_cost_by_idx.empty()) {
+            result.prepared.incident_cost_by_idx[static_cast<size_t>(i)] =
+                quotient_graph_->ExactIncidentCost(rep);
+          }
+          continue;
+        }
         w_by_idx[static_cast<size_t>(i)] =
             CreateWForSupernodeWithScratch(
                 rep, workspace->scratch,
-                &result.prepared.self_loops_by_idx[static_cast<size_t>(i)]);
-        result.prepared.agg_by_idx[static_cast<size_t>(i)] =
+                &result.prepared.self_loops_by_idx[static_cast<size_t>(i)],
+                ProfilingEnabled()
+                    ? &original_edges_scanned_by_idx[static_cast<size_t>(i)]
+                    : nullptr);
+        result.prepared.agg_by_idx[static_cast<size_t>(i)].SetOwned(
             AggregateWBySupernodeWithScratch(w_by_idx[static_cast<size_t>(i)],
-                                             workspace->scratch);
+                                             workspace->scratch));
         result.prepared.size_by_idx[static_cast<size_t>(i)] =
             static_cast<int64_t>(
                 supernode_sizes_by_rep_[static_cast<size_t>(rep)]);
       }
     }
   }
+  if (ProfilingEnabled()) {
+    for (int i = 0; i < group_size; ++i) {
+      result.stats.prepare_original_edges_scanned +=
+          original_edges_scanned_by_idx[static_cast<size_t>(i)];
+      result.stats.prepare_aggregated_nnz +=
+          result.prepared.agg_by_idx[static_cast<size_t>(i)].size();
+    }
+  }
   const auto create_w_end = std::chrono::steady_clock::now();
   result.stats.create_w_ms = ElapsedMs(create_w_start, create_w_end);
+  if (use_persistent) {
+    result.stats.prepare_row_views_created = static_cast<uint64_t>(group_size);
+    result.stats.quotient_row_lookup_ms = result.stats.create_w_ms;
+  } else {
+    for (const PreparedRow& row : result.prepared.agg_by_idx) {
+      result.stats.prepare_row_entries_copied += row.size();
+    }
+    result.stats.prepare_row_copy_bytes =
+        result.stats.prepare_row_entries_copied * sizeof(SparseCounts::value_type);
+  }
 
   const auto candidate_gen_start = std::chrono::steady_clock::now();
+  if (candidate_index_mode_ != CandidateIndexMode::kLegacy) {
+    const int source_count = group_size;
+    std::unordered_map<int, int> index_by_rep;
+    index_by_rep.reserve(static_cast<size_t>(source_count + candidate_budget_) *
+                         2U + 1U);
+    for (int i = 0; i < source_count; ++i) {
+      const int rep = result.prepared.q[static_cast<size_t>(i)];
+      if (I_[rep] != -1 && quotient_graph_->IsActive(rep)) {
+        index_by_rep.emplace(rep, i);
+      }
+    }
+    std::vector<CandidateProposal> proposals;
+    std::vector<uint64_t> candidate_keys;
+    candidate_keys.reserve(static_cast<size_t>(source_count) *
+                           static_cast<size_t>(candidate_budget_));
+    auto pair_key = [](int a_idx, int b_idx) {
+      const int lo = std::min(a_idx, b_idx);
+      const int hi = std::max(a_idx, b_idx);
+      return (static_cast<uint64_t>(static_cast<uint32_t>(lo)) << 32U) |
+             static_cast<uint32_t>(hi);
+    };
+    const auto proposal_start = std::chrono::steady_clock::now();
+    for (int source_idx = 0; source_idx < source_count; ++source_idx) {
+      const int source_rep = result.prepared.q[static_cast<size_t>(source_idx)];
+      if (I_[source_rep] == -1 || !quotient_graph_->IsActive(source_rep)) {
+        ++result.stats.candidate_index.nodes_with_zero_proposals;
+        continue;
+      }
+      candidate_index_->Propose(source_rep, candidate_budget_, &proposals,
+                                &result.stats.candidate_index);
+      for (const CandidateProposal& proposal : proposals) {
+        if (I_[proposal.target] == -1 ||
+            !quotient_graph_->IsActive(proposal.target)) {
+          continue;
+        }
+        auto [it, inserted] = index_by_rep.emplace(
+            proposal.target, static_cast<int>(result.prepared.q.size()));
+        if (inserted) {
+          result.prepared.q.push_back(proposal.target);
+          PreparedRow row;
+          row.SetView(quotient_graph_->GetRowView(proposal.target));
+          result.prepared.agg_by_idx.push_back(std::move(row));
+          result.prepared.size_by_idx.push_back(
+              quotient_graph_->GetSize(proposal.target));
+          result.prepared.self_loops_by_idx.push_back(0);
+          ++result.stats.prepare_row_views_created;
+        }
+        candidate_keys.push_back(pair_key(source_idx, it->second));
+      }
+    }
+    result.stats.candidate_proposal_ms = ElapsedMs(
+        proposal_start, std::chrono::steady_clock::now());
+    std::sort(candidate_keys.begin(), candidate_keys.end());
+    candidate_keys.erase(
+        std::unique(candidate_keys.begin(), candidate_keys.end()),
+        candidate_keys.end());
+    for (uint64_t key : candidate_keys) {
+      result.prepared.candidate_pairs.push_back(EaCandidatePair{
+          static_cast<int>(key >> 32U),
+          static_cast<int>(key & 0xffffffffU), 0, 0});
+    }
+    result.stats.candidate_proxy_pairs_examined =
+        result.stats.candidate_index.proposals_raw;
+    result.stats.candidate_pairs_after_prune = candidate_keys.size();
+    const auto candidate_gen_end = std::chrono::steady_clock::now();
+    result.stats.candidate_gen_ms =
+        ElapsedMs(candidate_gen_start, candidate_gen_end);
+    result.stats.wall_ms =
+        ElapsedMs(prepare_start, std::chrono::steady_clock::now());
+    return result;
+  }
+
   struct TargetEntry {
     int row_idx = -1;
     int64_t edges = 0;
@@ -1222,13 +1860,14 @@ Sweg::EaPrepareResult Sweg::PrepareBatchEncodingAwareGroupWithWorkspace(
       }
       const int64_t size_a =
           result.prepared.size_by_idx[static_cast<size_t>(a_idx)];
-      const int64_t edges_a = entries[ia].edges;
+        const int64_t edges_a = entries[ia].edges;
       for (size_t ib = ia + 1; ib < entries.size(); ++ib) {
         const int b_idx = entries[ib].row_idx;
         const int rep_b = result.prepared.q[static_cast<size_t>(b_idx)];
         if (target_rep == rep_b) {
           continue;
         }
+        ++result.stats.candidate_proxy_pairs_examined;
         const int64_t size_b =
             result.prepared.size_by_idx[static_cast<size_t>(b_idx)];
         const int64_t edges_b = entries[ib].edges;
@@ -1348,8 +1987,24 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroup(EaGroupPrepared* prepared,
   if (prepared == nullptr || prepared->candidate_pairs.empty()) {
     return;
   }
+  if (state_backend_ == StateBackend::kPersistent) {
+    for (const PreparedRow& row : prepared->agg_by_idx) {
+      row.view.ValidateVersion();
+    }
+  }
   stats_.merge_exact_gain_calls +=
       static_cast<uint64_t>(prepared->candidate_pairs.size());
+  if (ProfilingEnabled()) {
+    const uint64_t count = prepared->candidate_pairs.size();
+    runtime_profile_.current.candidate_pairs_submitted_for_scoring += count;
+    runtime_profile_.current.candidate_pairs_scored += count;
+    runtime_profile_.current.exact_gain_calls += count;
+    for (const EaCandidatePair& pair : prepared->candidate_pairs) {
+      runtime_profile_.current.exact_gain_input_nnz +=
+          prepared->agg_by_idx[static_cast<size_t>(pair.a_idx)].size() +
+          prepared->agg_by_idx[static_cast<size_t>(pair.b_idx)].size();
+    }
+  }
 
   std::vector<std::pair<int, int>> candidate_pairs;
   candidate_pairs.reserve(prepared->candidate_pairs.size());
@@ -1360,9 +2015,78 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroup(EaGroupPrepared* prepared,
   const auto gain_scoring_start = std::chrono::steady_clock::now();
   std::vector<LocalGainResult> gain_results;
   if (scoring_backend_ == ScoringBackend::kCpu) {
-    gain_results =
-        ScoreCandidatesCpu(candidate_pairs, prepared->agg_by_idx, prepared->q,
-                           prepared->size_by_idx, prepared->self_loops_by_idx);
+    if (state_backend_ == StateBackend::kPersistent &&
+        cost_objective_ == CostObjective::kMagsCompatible) {
+      ExactGainWorkCounters work;
+      if (certification_mode_ == CertificationMode::kSafe &&
+          candidate_index_mode_ == CandidateIndexMode::kLegacy) {
+        CertificationWorkCounters certification_work;
+        double upper_bound_ms = 0.0;
+        double early_abort_exact_ms = 0.0;
+        gain_results = ScoreCandidatesCertifiedPersistentCpu(
+            candidate_pairs, prepared->q, prepared->incident_cost_by_idx,
+            threshold, &certification_work,
+            &upper_bound_ms, &early_abort_exact_ms);
+        stats_.certification_candidates_seen +=
+            certification_work.candidates_seen;
+        stats_.upper_bound_pruned += certification_work.upper_bound_pruned;
+        stats_.upper_bound_passed += certification_work.upper_bound_passed;
+        stats_.early_abort_count += certification_work.early_abort_count;
+        stats_.exact_full_scan_count += certification_work.exact_full_scan_count;
+        stats_.exact_entries_available += certification_work.entries_available;
+        stats_.exact_entries_scanned += certification_work.entries_scanned;
+        stats_.exact_entries_skipped += certification_work.entries_available -
+                                        certification_work.entries_scanned;
+        stats_.upper_bound_ms += upper_bound_ms;
+        stats_.early_abort_exact_ms += early_abort_exact_ms;
+        if (ProfilingEnabled()) {
+          IterationProfile& profile = runtime_profile_.current;
+          profile.certification_candidates_seen +=
+              certification_work.candidates_seen;
+          profile.upper_bound_pruned += certification_work.upper_bound_pruned;
+          profile.upper_bound_passed += certification_work.upper_bound_passed;
+          profile.early_abort_count += certification_work.early_abort_count;
+          profile.exact_full_scan_count +=
+              certification_work.exact_full_scan_count;
+          profile.exact_entries_available +=
+              certification_work.entries_available;
+          profile.exact_entries_scanned += certification_work.entries_scanned;
+          profile.exact_entries_skipped +=
+              certification_work.entries_available -
+              certification_work.entries_scanned;
+          profile.upper_bound_ms += upper_bound_ms;
+          profile.early_abort_exact_ms += early_abort_exact_ms;
+        }
+      } else {
+        gain_results = ScoreCandidatesPersistentCpu(
+            candidate_pairs, prepared->q, ProfilingEnabled() ? &work : nullptr);
+      }
+      if (ProfilingEnabled()) {
+        IterationProfile& profile = runtime_profile_.current;
+        profile.exact_persistent_pairs += work.pairs;
+        profile.exact_raw_entries_a += work.raw_entries_a;
+        profile.exact_raw_entries_b += work.raw_entries_b;
+        profile.exact_union_neighbors += work.union_neighbors;
+        profile.exact_overlap_neighbors += work.overlap_neighbors;
+        profile.exact_single_sided_neighbors += work.single_sided_neighbors;
+        profile.exact_internal_block_terms += work.internal_block_terms;
+        profile.exact_block_cost_evaluations += work.block_cost_evaluations;
+        profile.exact_capacity_multiplications += work.capacity_multiplications;
+        stats_.exact_persistent_pairs += work.pairs;
+        stats_.exact_raw_entries_a += work.raw_entries_a;
+        stats_.exact_raw_entries_b += work.raw_entries_b;
+        stats_.exact_union_neighbors += work.union_neighbors;
+        stats_.exact_overlap_neighbors += work.overlap_neighbors;
+        stats_.exact_single_sided_neighbors += work.single_sided_neighbors;
+        stats_.exact_internal_block_terms += work.internal_block_terms;
+        stats_.exact_block_cost_evaluations += work.block_cost_evaluations;
+        stats_.exact_capacity_multiplications += work.capacity_multiplications;
+      }
+    } else {
+      gain_results = ScoreCandidatesCpu(
+          candidate_pairs, prepared->agg_by_idx, prepared->q,
+          prepared->size_by_idx, prepared->self_loops_by_idx);
+    }
   } else {
     const FlatAggCSR flat_agg =
         BuildFlatAggCsr(prepared->agg_by_idx, prepared->q, prepared->size_by_idx,
@@ -1374,6 +2098,16 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroup(EaGroupPrepared* prepared,
       ElapsedMs(gain_scoring_start, gain_scoring_end);
   stats_.merge_gain_scoring_ms += gain_scoring_ms;
   stats_.merge_scoring_ms += gain_scoring_ms;
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.exact_gain_ms += gain_scoring_ms;
+  }
+  if (state_backend_ == StateBackend::kPersistent &&
+      scoring_backend_ == ScoringBackend::kCpu) {
+    stats_.quotient_exact_gain_ms += gain_scoring_ms;
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.quotient_exact_gain_ms += gain_scoring_ms;
+    }
+  }
   AssignGainResultsToPreparedGroup(prepared, gain_results);
   FilterPreparedCandidatePairsByThreshold(prepared, threshold);
 }
@@ -1412,6 +2146,9 @@ void Sweg::FilterPreparedCandidatePairsByThreshold(EaGroupPrepared* prepared,
       stats_.merge_rejected_by_threshold += 1;
       continue;
     }
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.exact_gain_positive_count += 1;
+    }
     if (ea_use_threshold_) {
       if (pair.before_cost <= 0) {
         stats_.merge_rejected_by_threshold += 1;
@@ -1424,6 +2161,9 @@ void Sweg::FilterPreparedCandidatePairsByThreshold(EaGroupPrepared* prepared,
     }
     ++cur_accepted_pairs_;
     stats_.merge_positive_gain_pairs += 1;
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.above_threshold_count += 1;
+    }
     filtered.push_back(pair);
   }
   prepared->candidate_pairs.swap(filtered);
@@ -1471,10 +2211,17 @@ std::vector<std::pair<int, int>> Sweg::SelectScoredBatchEncodingAwareGroupPairs(
     total_local_gain += pair.gain;
   }
   const auto selection_end = std::chrono::steady_clock::now();
-  stats_.merge_selection_ms += ElapsedMs(selection_start, selection_end);
+  const double selection_ms = ElapsedMs(selection_start, selection_end);
+  stats_.merge_selection_ms += selection_ms;
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.matching_ms += selection_ms;
+  }
   stats_.merge_candidate_pairs +=
       static_cast<int64_t>(prepared.candidate_pairs.size());
   stats_.merge_selected_pairs += static_cast<int64_t>(selected_rep_pairs.size());
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.matching_selected_count += selected_rep_pairs.size();
+  }
   stats_.merge_total_local_gain += total_local_gain;
 
   return selected_rep_pairs;
@@ -1699,7 +2446,7 @@ Sweg::CudaBlockedBatch Sweg::BuildCudaBlockedBatch(
     const EaGroupPrepared& group = groups[i];
     total_rows += group.q.size();
     total_candidates += group.candidate_pairs.size();
-    for (const SparseCounts& row : group.agg_by_idx) {
+    for (const PreparedRow& row : group.agg_by_idx) {
       total_nnz += row.size();
     }
   }
@@ -1808,6 +2555,22 @@ void Sweg::ScoreBatchEncodingAwarePreparedGroupsBlockedCudaRange(
   stats_.merge_scoring_ms += gain_scoring_ms;
   stats_.merge_exact_gain_calls +=
       static_cast<uint64_t>(batch.candidate_pairs.size());
+  if (ProfilingEnabled()) {
+    const uint64_t count = batch.candidate_pairs.size();
+    runtime_profile_.current.candidate_pairs_submitted_for_scoring += count;
+    runtime_profile_.current.candidate_pairs_scored += count;
+    runtime_profile_.current.exact_gain_calls += count;
+    runtime_profile_.current.exact_gain_ms += gain_scoring_ms;
+    for (const auto& pair : batch.candidate_pairs) {
+      const size_t a = static_cast<size_t>(pair.first);
+      const size_t b = static_cast<size_t>(pair.second);
+      runtime_profile_.current.exact_gain_input_nnz +=
+          static_cast<uint64_t>(batch.flat_agg.offsets[a + 1] -
+                                batch.flat_agg.offsets[a]) +
+          static_cast<uint64_t>(batch.flat_agg.offsets[b + 1] -
+                                batch.flat_agg.offsets[b]);
+    }
+  }
 
   if (gain_results.size() != batch.destinations.size()) {
     throw std::runtime_error("CUDA scoring result size mismatch");
@@ -1837,16 +2600,101 @@ void Sweg::MergeBatchEncodingAwareGroup(const std::vector<int>& q,
   std::vector<std::pair<int, int>> selected_rep_pairs =
       SelectBatchEncodingAwareGroupPairs(q, threshold);
   const auto update_start = std::chrono::steady_clock::now();
-  for (const auto& pair : selected_rep_pairs) {
-    const int rep_a = pair.first;
-    const int rep_b = pair.second;
-    if (I_[rep_a] == -1 || I_[rep_b] == -1) {
+  CommitSelectedPairs(selected_rep_pairs);
+  const auto update_end = std::chrono::steady_clock::now();
+  const double update_ms = ElapsedMs(update_start, update_end);
+  stats_.merge_update_ms += update_ms;
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.update_ms += update_ms;
+  }
+}
+
+void Sweg::CommitSelectedPairs(
+    const std::vector<std::pair<int, int>>& pairs) {
+  std::vector<std::pair<int, int>> valid;
+  valid.reserve(pairs.size());
+  for (const auto& pair : pairs) {
+    if (I_[pair.first] != -1 && I_[pair.second] != -1 &&
+        ValidateMergeAgainstCurrentPartition(pair.first, pair.second)) {
+      valid.push_back(pair);
+    }
+  }
+
+  const bool may_bulk = quotient_graph_ != nullptr && valid.size() > 1 &&
+                        cost_objective_ == CostObjective::kLegacy;
+  bool use_bulk = may_bulk &&
+                  quotient_update_mode_ == QuotientUpdateMode::kBulkRebuild;
+  if (may_bulk && quotient_update_mode_ == QuotientUpdateMode::kAuto) {
+    const int active = std::max(1, CountActiveSupernodes());
+    const double reduction_ratio =
+        static_cast<double>(valid.size()) / static_cast<double>(active);
+    use_bulk = reduction_ratio >= 0.05 &&
+               quotient_graph_->EstimateIncrementalWork(valid) >
+                   quotient_graph_->Nnz();
+  }
+  if (use_bulk) {
+    const uint64_t touched = quotient_graph_->MergeBatchBulk(valid);
+    stats_.update_touched_quotient_entries += touched;
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.update_touched_quotient_entries += touched;
+    }
+    quotient_batch_precommitted_ = true;
+    ++stats_.quotient_bulk_rebuild_count;
+  } else if (quotient_graph_ != nullptr && !valid.empty()) {
+    ++stats_.quotient_incremental_batch_count;
+  }
+  for (const auto& pair : valid) {
+    Update_S(pair.first, pair.second);
+  }
+  quotient_batch_precommitted_ = false;
+  if (validate_quotient_ && quotient_graph_ != nullptr) {
+    quotient_graph_->ValidateAgainstOriginalGraph(*graph_,
+                                                  CurrentPartitionLabels());
+  }
+}
+
+std::vector<int> Sweg::CurrentPartitionLabels() const {
+  std::vector<int> labels(static_cast<size_t>(n_), -1);
+  for (int rep = 0; rep < n_; ++rep) {
+    if (I_[rep] == -1) {
       continue;
     }
-    Update_S(rep_a, rep_b);
+    int node = I_[rep];
+    while (node != -1) {
+      labels[static_cast<size_t>(node)] = rep;
+      node = J_[node];
+    }
   }
-  const auto update_end = std::chrono::steady_clock::now();
-  stats_.merge_update_ms += ElapsedMs(update_start, update_end);
+  if (std::find(labels.begin(), labels.end(), -1) != labels.end()) {
+    throw std::runtime_error("Partition contains an unlabeled node");
+  }
+  return labels;
+}
+
+bool Sweg::ValidateMergeAgainstCurrentPartition(int rep_a, int rep_b) const {
+  if (cost_objective_ != CostObjective::kMagsCompatible) {
+    return true;
+  }
+  if (quotient_graph_ != nullptr) {
+    const MergeGain quotient_gain =
+        quotient_graph_->ExactMergeGain(rep_a, rep_b);
+    if (validate_quotient_) {
+      const std::vector<int> labels = CurrentPartitionLabels();
+      const MergeGain full_gain =
+          cost_oracle_.ExactMergeGain(*graph_, labels, rep_a, rep_b);
+      if (quotient_gain != full_gain) {
+        throw std::runtime_error(
+            "Quotient merge gain differs from full CostOracle recomputation");
+      }
+    }
+    return quotient_gain > 0;
+  }
+  const std::vector<int> labels = CurrentPartitionLabels();
+  return cost_oracle_.ExactMergeGain(*graph_, labels, rep_a, rep_b) > 0;
+}
+
+EncodingCost Sweg::ExactCurrentPartitionCost() const {
+  return cost_oracle_.ExactPartitionCost(*graph_, CurrentPartitionLabels());
 }
 
 int Sweg::SupernodeLength(int key) const {
@@ -1876,6 +2724,21 @@ void Sweg::Update_S(int A, int B) {
   if (nodes_a.empty() || nodes_b.empty()) {
     return;
   }
+  if (quotient_graph_ != nullptr && !quotient_batch_precommitted_) {
+    const uint64_t touched = quotient_graph_->Merge(A, B);
+    stats_.update_touched_quotient_entries += touched;
+    if (ProfilingEnabled()) {
+      runtime_profile_.current.update_touched_quotient_entries += touched;
+    }
+  }
+  if (candidate_index_ != nullptr) {
+    candidate_index_->OnMerge(A, B);
+  }
+  if (ProfilingEnabled()) {
+    runtime_profile_.current.actual_merge_count += 1;
+    runtime_profile_.current.update_partition_nodes_touched +=
+        nodes_a.size() + nodes_b.size();
+  }
 
   J_[nodes_a.back()] = I_[B];
   I_[B] = -1;
@@ -1888,6 +2751,11 @@ void Sweg::Update_S(int A, int B) {
   }
   supernode_sizes_by_rep_[A] = static_cast<int>(nodes_a.size() + nodes_b.size());
   supernode_sizes_by_rep_[B] = 0;
+  if (validate_quotient_ && quotient_graph_ != nullptr &&
+      !quotient_batch_precommitted_) {
+    quotient_graph_->ValidateAgainstOriginalGraph(*graph_,
+                                                  CurrentPartitionLabels());
+  }
 }
 
 EncodingResult Sweg::Encode() {
@@ -1934,9 +2802,13 @@ EncodingResult Sweg::Encode() {
       if (sv < 0) {
         throw std::runtime_error("Invalid node_to_supernode during encode.");
       }
-      // Preserve the original encode_old-style semantics: only keep
-      // arcs whose source supernode id is <= destination supernode id.
+      // The authoritative objective materializes each undirected internal
+      // edge once; legacy mode preserves the historical two-arc payload.
       if (su > sv) {
+        continue;
+      }
+      if (cost_objective_ == CostObjective::kMagsCompatible && su == sv &&
+          u >= v) {
         continue;
       }
       pair_arcs.push_back(PairArc{PackEdge(su, sv), u, v});
@@ -1973,14 +2845,19 @@ EncodingResult Sweg::Encode() {
         static_cast<int64_t>(result.supernode_sizes[static_cast<size_t>(B)]);
 
     const auto decision_start = std::chrono::steady_clock::now();
-    const double edge_compare_cond =
-        (A == B)
-            ? (static_cast<double>(size_a) *
-               static_cast<double>(size_a - 1) / 4.0)
-            : (static_cast<double>(size_a) * static_cast<double>(size_b) /
-               2.0);
+    const int64_t capacity =
+        A == B ? size_a * (size_a - 1) / 2 : size_a * size_b;
+    const bool use_sparse =
+        cost_objective_ == CostObjective::kMagsCompatible
+            ? real_edges <= 1 + capacity - real_edges
+            : static_cast<double>(real_edges) <=
+                  ((A == B)
+                       ? (static_cast<double>(size_a) *
+                          static_cast<double>(size_a - 1) / 4.0)
+                       : (static_cast<double>(size_a) *
+                          static_cast<double>(size_b) / 2.0));
 
-    if (static_cast<double>(real_edges) <= edge_compare_cond) {
+    if (use_sparse) {
       auto& dst = result.Cp;
       for (size_t i = begin; i < end; ++i) {
         dst.push_back(EdgePair{pair_arcs[i].u, pair_arcs[i].v});
@@ -2006,7 +2883,9 @@ EncodingResult Sweg::Encode() {
     const std::vector<int>& in_b = result.supernodes[static_cast<size_t>(B)];
     for (int u : in_a) {
       for (int v : in_b) {
-        if (A == B && u == v) {
+        if (A == B &&
+            (cost_objective_ == CostObjective::kMagsCompatible ? u >= v
+                                                                : u == v)) {
           continue;
         }
         if (edge_set.find(PackEdge(u, v)) == edge_set.end()) {

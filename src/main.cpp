@@ -1,4 +1,5 @@
 #include "graph_io/graph_io.hpp"
+#include "compression_metrics.hpp"
 #include "cuda_scoring.hpp"
 #include "sweg.hpp"
 
@@ -39,6 +40,15 @@ struct CliOptions {
   uint64_t seed = 1;
   bool write_output = false;
   bool verify_cuda_gain = false;
+  ProfilingMode profiling_mode = ProfilingMode::kOff;
+  CostObjective cost_objective = CostObjective::kLegacy;
+  StateBackend state_backend = StateBackend::kLegacy;
+  bool validate_quotient = false;
+  QuotientUpdateMode quotient_update_mode = QuotientUpdateMode::kIncremental;
+  CandidateIndexMode candidate_index_mode = CandidateIndexMode::kLegacy;
+  int candidate_budget = 8;
+  CertificationMode certification_mode = CertificationMode::kOff;
+  std::string profile_csv;
   bool show_help = false;
 };
 
@@ -59,6 +69,15 @@ static void PrintUsage() {
       << "  --merge-mode <batch-ea|batch-ea-blocked>\n"
       << "  --scoring-backend <cpu|cuda>\n"
       << "  --verify-cuda-gain      Debug hook for CPU/GPU gain checks\n"
+      << "  --cost-objective <legacy|mags-compatible> Exact merge and encoding objective (default: legacy)\n"
+      << "  --state-backend <legacy|persistent> Supernode adjacency state (default: legacy)\n"
+      << "  --validate-quotient     Rebuild quotient state after every merge (debug only)\n"
+      << "  --quotient-update <incremental|bulk_rebuild|auto> Persistent update strategy (default: incremental)\n"
+      << "  --candidate-index <legacy|quotient-neighbor|residual-signature> Candidate proposal backend (default: legacy)\n"
+      << "  --candidate-budget <int> Per-source proposal budget (default: 8)\n"
+      << "  --certification <off|safe> Safe persistent CPU exact certification (default: off)\n"
+      << "  --profiling <off|summary|rounds> Collect Stage 0 runtime profile (default: off)\n"
+      << "  --profile-csv <path>    Write long-form per-iteration profile CSV\n"
       << "  --top-k <int>           Top-k EA-proxy candidates per supernode for batch-ea modes\n"
       << "  --group-batch-size <int> Block size for batch-ea-blocked\n"
       << "  --candidate-batch-budget <int> Candidate budget per CUDA blocked batch\n"
@@ -117,6 +136,107 @@ static ThresholdPolicy ParseThresholdPolicy(const std::string& value) {
     return ThresholdPolicy::kAdaptive;
   }
   throw std::runtime_error("Unsupported threshold policy: " + value);
+}
+
+static ProfilingMode ParseProfilingMode(const std::string& value) {
+  if (value == "off") {
+    return ProfilingMode::kOff;
+  }
+  if (value == "summary") {
+    return ProfilingMode::kSummary;
+  }
+  if (value == "rounds") {
+    return ProfilingMode::kRounds;
+  }
+  throw std::runtime_error("Unsupported profiling mode: " + value);
+}
+
+static CertificationMode ParseCertificationMode(const std::string& value) {
+  if (value == "off") {
+    return CertificationMode::kOff;
+  }
+  if (value == "safe") {
+    return CertificationMode::kSafe;
+  }
+  throw std::runtime_error("Unsupported certification mode: " + value);
+}
+
+static const char* CertificationModeToString(CertificationMode mode) {
+  return mode == CertificationMode::kSafe ? "safe" : "off";
+}
+
+static CostObjective ParseCostObjective(const std::string& value) {
+  if (value == "legacy") {
+    return CostObjective::kLegacy;
+  }
+  if (value == "mags-compatible") {
+    return CostObjective::kMagsCompatible;
+  }
+  throw std::runtime_error("Unsupported cost objective: " + value);
+}
+
+static const char* CostObjectiveToString(CostObjective objective) {
+  return objective == CostObjective::kMagsCompatible ? "mags-compatible"
+                                                     : "legacy";
+}
+
+static StateBackend ParseStateBackend(const std::string& value) {
+  if (value == "legacy") {
+    return StateBackend::kLegacy;
+  }
+  if (value == "persistent") {
+    return StateBackend::kPersistent;
+  }
+  throw std::runtime_error("Unsupported state backend: " + value);
+}
+
+static const char* StateBackendToString(StateBackend backend) {
+  return backend == StateBackend::kPersistent ? "persistent" : "legacy";
+}
+
+static QuotientUpdateMode ParseQuotientUpdateMode(const std::string& value) {
+  if (value == "incremental") return QuotientUpdateMode::kIncremental;
+  if (value == "bulk_rebuild") return QuotientUpdateMode::kBulkRebuild;
+  if (value == "auto") return QuotientUpdateMode::kAuto;
+  throw std::runtime_error("Unsupported quotient update mode: " + value);
+}
+
+static const char* QuotientUpdateModeToString(QuotientUpdateMode mode) {
+  switch (mode) {
+    case QuotientUpdateMode::kIncremental: return "incremental";
+    case QuotientUpdateMode::kBulkRebuild: return "bulk_rebuild";
+    case QuotientUpdateMode::kAuto: return "auto";
+  }
+  return "unknown";
+}
+
+static CandidateIndexMode ParseCandidateIndexMode(const std::string& value) {
+  if (value == "legacy") return CandidateIndexMode::kLegacy;
+  if (value == "quotient-neighbor") {
+    return CandidateIndexMode::kQuotientNeighbor;
+  }
+  if (value == "residual-signature") {
+    return CandidateIndexMode::kResidualSignature;
+  }
+  throw std::runtime_error("Unsupported candidate index: " + value);
+}
+
+static const char* ProfilingModeToString(ProfilingMode mode) {
+  switch (mode) {
+    case ProfilingMode::kOff:
+      return "off";
+    case ProfilingMode::kSummary:
+      return "summary";
+    case ProfilingMode::kRounds:
+      return "rounds";
+  }
+  return "unknown";
+}
+
+static std::string DatasetLabelFromPath(const std::string& input) {
+  std::filesystem::path path(input);
+  std::string label = path.parent_path().filename().string();
+  return label.empty() ? path.stem().string() : label;
 }
 
 static std::string FormatDouble(double value) {
@@ -206,6 +326,24 @@ static CliOptions ParseArgs(int argc, char** argv) {
       opts.scoring_backend = ParseScoringBackend(argv[++i]);
     } else if (arg == "--verify-cuda-gain") {
       opts.verify_cuda_gain = true;
+    } else if (arg == "--cost-objective" && i + 1 < argc) {
+      opts.cost_objective = ParseCostObjective(argv[++i]);
+    } else if (arg == "--state-backend" && i + 1 < argc) {
+      opts.state_backend = ParseStateBackend(argv[++i]);
+    } else if (arg == "--validate-quotient") {
+      opts.validate_quotient = true;
+    } else if (arg == "--quotient-update" && i + 1 < argc) {
+      opts.quotient_update_mode = ParseQuotientUpdateMode(argv[++i]);
+    } else if (arg == "--candidate-index" && i + 1 < argc) {
+      opts.candidate_index_mode = ParseCandidateIndexMode(argv[++i]);
+    } else if (arg == "--candidate-budget" && i + 1 < argc) {
+      opts.candidate_budget = std::stoi(argv[++i]);
+    } else if (arg == "--certification" && i + 1 < argc) {
+      opts.certification_mode = ParseCertificationMode(argv[++i]);
+    } else if (arg == "--profiling" && i + 1 < argc) {
+      opts.profiling_mode = ParseProfilingMode(argv[++i]);
+    } else if (arg == "--profile-csv" && i + 1 < argc) {
+      opts.profile_csv = argv[++i];
     } else if (arg == "--top-k" && i + 1 < argc) {
       opts.top_k = std::stoi(argv[++i]);
     } else if (arg == "--group-batch-size" && i + 1 < argc) {
@@ -272,6 +410,32 @@ int main(int argc, char** argv) {
       throw std::runtime_error(
           "--write-output requires --out <dir>.");
     }
+    if (opts.cost_objective == CostObjective::kMagsCompatible &&
+        opts.scoring_backend == ScoringBackend::kCuda) {
+      throw std::runtime_error(
+          "--cost-objective mags-compatible currently requires --scoring-backend cpu");
+    }
+    if (opts.validate_quotient && opts.state_backend != StateBackend::kPersistent) {
+      throw std::runtime_error(
+          "--validate-quotient requires --state-backend persistent");
+    }
+    if (opts.quotient_update_mode != QuotientUpdateMode::kIncremental &&
+        opts.state_backend != StateBackend::kPersistent) {
+      throw std::runtime_error(
+          "non-incremental --quotient-update requires --state-backend persistent");
+    }
+    if (opts.candidate_budget <= 0) {
+      throw std::runtime_error("--candidate-budget must be positive");
+    }
+    if (opts.certification_mode == CertificationMode::kSafe &&
+        (opts.state_backend != StateBackend::kPersistent ||
+         opts.scoring_backend != ScoringBackend::kCpu ||
+         opts.cost_objective != CostObjective::kMagsCompatible ||
+         opts.candidate_index_mode != CandidateIndexMode::kLegacy)) {
+      throw std::runtime_error(
+          "--certification safe requires persistent state, CPU scoring, "
+          "MAGS-compatible cost, and the legacy candidate index");
+    }
 
     CSRGraph graph = LoadUndirectedEdgeList(opts.input);
     if (graph.m != graph.input_edges_raw * 2) {
@@ -308,6 +472,12 @@ int main(int argc, char** argv) {
               << ScoringBackendToString(opts.scoring_backend) << "\n";
     std::cout << "Threshold policy: "
               << ThresholdPolicyToString(opts.threshold_policy) << "\n";
+    std::cout << "Cost objective: "
+              << CostObjectiveToString(opts.cost_objective) << "\n";
+    std::cout << "State backend: " << StateBackendToString(opts.state_backend)
+              << "\n";
+    std::cout << "Quotient update: "
+              << QuotientUpdateModeToString(opts.quotient_update_mode) << "\n";
     std::cout << "CUDA scoring build: " << CudaScoringBuildMode() << "\n";
     if (opts.write_output) {
       std::cout << "Output directory: " << opts.out_dir << "\n";
@@ -330,7 +500,11 @@ int main(int argc, char** argv) {
               opts.group_batch_size, opts.candidate_batch_budget,
               opts.cuda_slice_memory_mb,
               opts.overflow_group_gmax, opts.overflow_refine_rounds,
-              opts.divide_hash_dims, opts.divide_max_group, threshold_config);
+              opts.divide_hash_dims, opts.divide_max_group, threshold_config,
+              opts.profiling_mode, opts.cost_objective, opts.state_backend,
+              opts.validate_quotient, opts.quotient_update_mode,
+              opts.candidate_index_mode, opts.candidate_budget,
+              opts.certification_mode);
     sweg.Run(opts.iterations, opts.print_offset);
 
     const auto encode_start = std::chrono::steady_clock::now();
@@ -358,20 +532,24 @@ int main(int argc, char** argv) {
     const double runtime_end_to_end_ms =
         runtime_algorithm_ms + stats.runtime_output_ms;
 
-    const size_t encoded_edges =
-        result.P.size() + result.Cp.size() + result.Cm.size();
-    const double cost_ratio =
-        original_edges_eval > 0
-            ? static_cast<double>(encoded_edges) /
-                  static_cast<double>(original_edges_eval)
-            : 0.0;
-    const double compression_gain = 1.0 - cost_ratio;
+    const CompressionMetrics compression_metrics = ComputeCompressionMetrics(
+        result, input_edges_raw, opts.cost_objective);
+    const EncodingCost exact_partition_cost = sweg.ExactCurrentPartitionCost();
+    if (opts.cost_objective == CostObjective::kMagsCompatible &&
+        opts.error_bound == 0.0 &&
+        compression_metrics.encoding_cost_standard != exact_partition_cost) {
+      throw std::runtime_error(
+          "MAGS-compatible payload cost differs from exact partition cost");
+    }
+    const double compression_gain =
+        1.0 - compression_metrics.cost_ratio_standard;
     const double compression_java_style = compression_gain;
     const std::string merge_mode = MergeModeToString(opts.merge_mode);
     const std::string scoring_backend =
         ScoringBackendToString(opts.scoring_backend);
     const std::string threshold_policy =
         ThresholdPolicyToString(opts.threshold_policy);
+    const std::string profiling_mode = ProfilingModeToString(opts.profiling_mode);
 
     PrintMetric("n", std::to_string(graph.n));
     PrintMetric("input_edges_raw", std::to_string(input_edges_raw));
@@ -386,6 +564,15 @@ int main(int argc, char** argv) {
     PrintMetric("merge_mode", merge_mode);
     PrintMetric("scoring_backend", scoring_backend);
     PrintMetric("threshold_policy", threshold_policy);
+    PrintMetric("profiling_mode", profiling_mode);
+    PrintMetric("cost_objective", CostObjectiveToString(opts.cost_objective));
+    PrintMetric("state_backend", StateBackendToString(opts.state_backend));
+    PrintMetric("certification",
+                CertificationModeToString(opts.certification_mode));
+    PrintMetric("validate_quotient", opts.validate_quotient ? "true" : "false");
+    PrintMetric("quotient_update",
+                QuotientUpdateModeToString(opts.quotient_update_mode));
+    PrintMetric("exact_partition_cost", std::to_string(exact_partition_cost));
     PrintMetric("top_k", std::to_string(opts.top_k));
     PrintMetric("group_batch_size", std::to_string(opts.group_batch_size));
     PrintMetric("candidate_batch_budget",
@@ -401,8 +588,28 @@ int main(int argc, char** argv) {
     PrintMetric("P", std::to_string(result.P.size()));
     PrintMetric("Cp", std::to_string(result.Cp.size()));
     PrintMetric("Cm", std::to_string(result.Cm.size()));
-    PrintMetric("encoding_cost", std::to_string(encoded_edges));
-    PrintMetric("cost_ratio", FormatDouble(cost_ratio));
+    // Legacy names retain the original BEAM standard metric.
+    PrintMetric("encoding_cost",
+                std::to_string(compression_metrics.encoding_cost_standard));
+    PrintMetric("cost_ratio", FormatDouble(compression_metrics.cost_ratio_standard));
+    PrintMetric("num_superedges_nonloop",
+                std::to_string(compression_metrics.num_superedges_nonloop));
+    PrintMetric("num_superedges_loop",
+                std::to_string(compression_metrics.num_superedges_loop));
+    PrintMetric("num_positive_corrections",
+                std::to_string(compression_metrics.num_positive_corrections));
+    PrintMetric("num_negative_corrections",
+                std::to_string(compression_metrics.num_negative_corrections));
+    PrintMetric("encoding_cost_standard",
+                std::to_string(compression_metrics.encoding_cost_standard));
+    PrintMetric("cost_ratio_standard",
+                FormatDouble(compression_metrics.cost_ratio_standard));
+    PrintMetric("encoding_cost_mags_x2",
+                std::to_string(compression_metrics.encoding_cost_mags_x2));
+    PrintMetric("encoding_cost_mags_compatible",
+                FormatDouble(compression_metrics.encoding_cost_mags_compatible));
+    PrintMetric("cost_ratio_mags_compatible",
+                FormatDouble(compression_metrics.cost_ratio_mags_compatible));
     PrintMetric("compression_gain", FormatDouble(compression_gain));
     PrintMetric("compression_java_style", FormatDouble(compression_java_style));
     PrintMetric("runtime_run_ms", FormatDouble(stats.runtime_run_ms));
@@ -465,6 +672,158 @@ int main(int argc, char** argv) {
                 FormatDouble(stats.merge_exact_gain_calls_per_selected));
     PrintMetric("merge_positive_gain_ratio",
                 FormatDouble(stats.merge_positive_gain_ratio));
+    PrintMetric("certification_candidates_seen",
+                std::to_string(stats.certification_candidates_seen));
+    PrintMetric("upper_bound_pruned",
+                std::to_string(stats.upper_bound_pruned));
+    PrintMetric("upper_bound_passed",
+                std::to_string(stats.upper_bound_passed));
+    PrintMetric("upper_bound_prune_rate",
+                FormatDouble(SafeMetricRatio(
+                    stats.upper_bound_pruned,
+                    std::max<uint64_t>(1, stats.certification_candidates_seen))));
+    PrintMetric("early_abort_count", std::to_string(stats.early_abort_count));
+    PrintMetric("early_abort_rate",
+                FormatDouble(SafeMetricRatio(
+                    stats.early_abort_count,
+                    std::max<uint64_t>(1, stats.upper_bound_passed))));
+    PrintMetric("exact_full_scan_count",
+                std::to_string(stats.exact_full_scan_count));
+    PrintMetric("exact_entries_available",
+                std::to_string(stats.exact_entries_available));
+    PrintMetric("exact_entries_scanned",
+                std::to_string(stats.exact_entries_scanned));
+    PrintMetric("exact_entries_skipped",
+                std::to_string(stats.exact_entries_skipped));
+    PrintMetric("upper_bound_ms", FormatDouble(stats.upper_bound_ms));
+    PrintMetric("early_abort_exact_ms",
+                FormatDouble(stats.early_abort_exact_ms));
+    PrintMetric("update_touched_quotient_entries",
+                std::to_string(stats.update_touched_quotient_entries));
+    PrintMetric("quotient_nnz_final", std::to_string(stats.quotient_nnz_final));
+    PrintMetric("quotient_incremental_batch_count",
+                std::to_string(stats.quotient_incremental_batch_count));
+    PrintMetric("quotient_bulk_rebuild_count",
+                std::to_string(stats.quotient_bulk_rebuild_count));
+    PrintMetric("prepare_row_entries_copied",
+                std::to_string(stats.prepare_row_entries_copied));
+    PrintMetric("prepare_row_copy_bytes",
+                std::to_string(stats.prepare_row_copy_bytes));
+    PrintMetric("prepare_row_views_created",
+                std::to_string(stats.prepare_row_views_created));
+    PrintMetric("prepare_unique_representatives",
+                std::to_string(stats.prepare_unique_representatives));
+    PrintMetric("prepare_row_acquisition_requests",
+                std::to_string(stats.prepare_row_acquisition_requests));
+    PrintMetric("prepare_row_acquisition_hits",
+                std::to_string(stats.prepare_row_acquisition_hits));
+    PrintMetric("prepare_row_acquisition_misses",
+                std::to_string(stats.prepare_row_acquisition_misses));
+    PrintMetric("prepare_duplicate_acquisitions_avoided",
+                std::to_string(stats.prepare_duplicate_acquisitions_avoided));
+    PrintMetric("prepare_row_registry_entries",
+                std::to_string(stats.prepare_row_registry_entries));
+    PrintMetric("prepare_row_registry_bytes",
+                std::to_string(stats.prepare_row_registry_bytes));
+    PrintMetric("exact_persistent_pairs",
+                std::to_string(stats.exact_persistent_pairs));
+    PrintMetric("exact_raw_entries_a",
+                std::to_string(stats.exact_raw_entries_a));
+    PrintMetric("exact_raw_entries_b",
+                std::to_string(stats.exact_raw_entries_b));
+    PrintMetric("exact_union_neighbors",
+                std::to_string(stats.exact_union_neighbors));
+    PrintMetric("exact_overlap_neighbors",
+                std::to_string(stats.exact_overlap_neighbors));
+    PrintMetric("exact_single_sided_neighbors",
+                std::to_string(stats.exact_single_sided_neighbors));
+    PrintMetric("exact_internal_block_terms",
+                std::to_string(stats.exact_internal_block_terms));
+    PrintMetric("exact_block_cost_evaluations",
+                std::to_string(stats.exact_block_cost_evaluations));
+    PrintMetric("exact_capacity_multiplications",
+                std::to_string(stats.exact_capacity_multiplications));
+    PrintMetric("candidate_index_build_ms",
+                FormatDouble(stats.candidate_index_build_ms));
+    PrintMetric("candidate_index_refresh_ms",
+                FormatDouble(stats.candidate_index_refresh_ms));
+    PrintMetric("candidate_proposal_ms",
+                FormatDouble(stats.candidate_proposal_ms));
+    PrintMetric("candidate_proposals_raw",
+                std::to_string(stats.candidate_proposals_raw));
+    PrintMetric("candidate_proposals_unique",
+                std::to_string(stats.candidate_proposals_unique));
+    PrintMetric("candidate_duplicates_removed",
+                std::to_string(stats.candidate_duplicates_removed));
+    PrintMetric("candidate_budget_exhausted_nodes",
+                std::to_string(stats.candidate_budget_exhausted_nodes));
+    PrintMetric("candidate_nodes_with_zero_proposals",
+                std::to_string(stats.candidate_nodes_with_zero_proposals));
+    PrintMetric("candidate_direct_neighbor_count",
+                std::to_string(stats.candidate_direct_neighbor_count));
+    PrintMetric("candidate_shared_neighbor_count",
+                std::to_string(stats.candidate_shared_neighbor_count));
+    PrintMetric("candidate_exploration_count",
+                std::to_string(stats.candidate_exploration_count));
+    PrintMetric("residual_signature_build_ms",
+                FormatDouble(stats.residual_signature_build_ms));
+    PrintMetric("residual_signature_refresh_ms",
+                FormatDouble(stats.residual_signature_refresh_ms));
+    PrintMetric("residual_signature_rows_scanned",
+                std::to_string(stats.residual_signature_rows_scanned));
+    PrintMetric("residual_signature_features_created",
+                std::to_string(stats.residual_signature_features_created));
+    PrintMetric("residual_signature_cache_hits",
+                std::to_string(stats.residual_signature_cache_hits));
+    PrintMetric("residual_signature_cache_misses",
+                std::to_string(stats.residual_signature_cache_misses));
+    PrintMetric("residual_bucket_count",
+                std::to_string(stats.residual_bucket_count));
+    PrintMetric("residual_bucket_max_size",
+                std::to_string(stats.residual_bucket_max_size));
+    PrintMetric("residual_bucket_candidates_considered",
+                std::to_string(stats.residual_bucket_candidates_considered));
+    PrintMetric("residual_bucket_candidates_dropped_by_cap",
+                std::to_string(stats.residual_bucket_candidates_dropped_by_cap));
+    PrintMetric("residual_alignment_score_sum",
+                std::to_string(stats.residual_alignment_score_sum));
+    PrintMetric("residual_conflict_penalty_sum",
+                std::to_string(stats.residual_conflict_penalty_sum));
+    PrintMetric("residual_direct_score_sum",
+                std::to_string(stats.residual_direct_score_sum));
+    PrintMetric("residual_size_compatibility_sum",
+                std::to_string(stats.residual_size_compatibility_sum));
+    PrintMetric("quotient_row_lookup_ms",
+                FormatDouble(stats.quotient_row_lookup_ms));
+    PrintMetric("quotient_row_copy_ms",
+                FormatDouble(stats.quotient_row_copy_ms));
+    PrintMetric("quotient_exact_gain_ms",
+                FormatDouble(stats.quotient_exact_gain_ms));
+    PrintMetric("quotient_incremental_update_ms",
+                FormatDouble(stats.quotient_incremental_update_ms));
+    PrintMetric("quotient_reciprocal_update_ms",
+                FormatDouble(stats.quotient_reciprocal_update_ms));
+    PrintMetric("quotient_memory_allocation_ms",
+                FormatDouble(stats.quotient_memory_allocation_ms));
+    PrintMetric("quotient_sort_or_merge_ms",
+                FormatDouble(stats.quotient_sort_or_merge_ms));
+    PrintMetric("quotient_rebuild_ms", FormatDouble(stats.quotient_rebuild_ms));
+    PrintMetric("quotient_rows_updated",
+                std::to_string(stats.quotient_rows_updated));
+    PrintMetric("quotient_entries_inserted",
+                std::to_string(stats.quotient_entries_inserted));
+    PrintMetric("quotient_entries_removed",
+                std::to_string(stats.quotient_entries_removed));
+    PrintMetric("quotient_entries_shifted",
+                std::to_string(stats.quotient_entries_shifted));
+    PrintMetric("quotient_high_degree_rows_touched",
+                std::to_string(stats.quotient_high_degree_rows_touched));
+    PrintMetric("quotient_max_row_degree",
+                std::to_string(stats.quotient_max_row_degree));
+    PrintMetric("quotient_allocated_bytes",
+                std::to_string(stats.quotient_allocated_bytes));
+    PrintMetric("quotient_peak_nnz",
+                std::to_string(stats.quotient_peak_nnz));
     PrintMetric("threshold_last", FormatDouble(stats.threshold_last));
     PrintMetric("threshold_geom_last", FormatDouble(stats.threshold_geom_last));
     PrintMetric("threshold_adaptive_last",
@@ -536,6 +895,228 @@ int main(int argc, char** argv) {
                 FormatDouble(stats.encode_correction_generation_ms));
     PrintMetric("reconstruction_pass", "unknown");
 
+    const RuntimeProfile& runtime_profile = sweg.runtime_profile();
+    if (opts.profiling_mode != ProfilingMode::kOff) {
+      PrintMetric("profile_iterations_observed",
+                  std::to_string(runtime_profile.iterations_observed));
+      PrintMetric("profile_active_supernodes_last",
+                  std::to_string(runtime_profile.active_supernodes_last));
+      PrintMetric("profile_group_count_last",
+                  std::to_string(runtime_profile.group_count_last));
+      PrintMetric("profile_sum_group_sizes_last",
+                  std::to_string(runtime_profile.sum_group_sizes_last));
+      const IterationProfile& total_profile = runtime_profile.total;
+      PrintMetric("candidate_proxy_pairs_examined",
+                  std::to_string(total_profile.candidate_proxy_pairs_examined));
+      PrintMetric("candidate_pairs_after_topk",
+                  std::to_string(total_profile.candidate_pairs_after_topk));
+      PrintMetric("candidate_pairs_submitted_for_scoring",
+                  std::to_string(total_profile.candidate_pairs_submitted_for_scoring));
+      PrintMetric("candidate_pairs_scored",
+                  std::to_string(total_profile.candidate_pairs_scored));
+      PrintMetric("exact_gain_calls_profiled",
+                  std::to_string(total_profile.exact_gain_calls));
+      PrintMetric("exact_gain_positive_count",
+                  std::to_string(total_profile.exact_gain_positive_count));
+      PrintMetric("above_threshold_count",
+                  std::to_string(total_profile.above_threshold_count));
+      PrintMetric("matching_selected_count",
+                  std::to_string(total_profile.matching_selected_count));
+      PrintMetric("actual_merge_count",
+                  std::to_string(total_profile.actual_merge_count));
+      PrintMetric("prepare_original_edges_scanned",
+                  std::to_string(total_profile.prepare_original_edges_scanned));
+      PrintMetric("prepare_aggregated_nnz",
+                  std::to_string(total_profile.prepare_aggregated_nnz));
+      PrintMetric("exact_gain_input_nnz",
+                  std::to_string(total_profile.exact_gain_input_nnz));
+      PrintMetric("update_partition_nodes_touched",
+                  std::to_string(total_profile.update_partition_nodes_touched));
+      PrintMetric("prepare_row_entries_copied_profiled",
+                  std::to_string(total_profile.prepare_row_entries_copied));
+      PrintMetric("prepare_row_copy_bytes_profiled",
+                  std::to_string(total_profile.prepare_row_copy_bytes));
+      PrintMetric("prepare_row_views_created_profiled",
+                  std::to_string(total_profile.prepare_row_views_created));
+      PrintMetric("prepare_unique_representatives_profiled",
+                  std::to_string(total_profile.prepare_unique_representatives));
+      PrintMetric("prepare_row_acquisition_requests_profiled",
+                  std::to_string(
+                      total_profile.prepare_row_acquisition_requests));
+      PrintMetric("prepare_row_acquisition_hits_profiled",
+                  std::to_string(total_profile.prepare_row_acquisition_hits));
+      PrintMetric("prepare_row_acquisition_misses_profiled",
+                  std::to_string(total_profile.prepare_row_acquisition_misses));
+      PrintMetric("prepare_duplicate_acquisitions_avoided_profiled",
+                  std::to_string(
+                      total_profile.prepare_duplicate_acquisitions_avoided));
+      PrintMetric("prepare_row_registry_entries_profiled",
+                  std::to_string(total_profile.prepare_row_registry_entries));
+      PrintMetric("prepare_row_registry_bytes_profiled",
+                  std::to_string(total_profile.prepare_row_registry_bytes));
+      PrintMetric("exact_persistent_pairs_profiled",
+                  std::to_string(total_profile.exact_persistent_pairs));
+      PrintMetric("exact_raw_entries_a_profiled",
+                  std::to_string(total_profile.exact_raw_entries_a));
+      PrintMetric("exact_raw_entries_b_profiled",
+                  std::to_string(total_profile.exact_raw_entries_b));
+      PrintMetric("exact_union_neighbors_profiled",
+                  std::to_string(total_profile.exact_union_neighbors));
+      PrintMetric("exact_overlap_neighbors_profiled",
+                  std::to_string(total_profile.exact_overlap_neighbors));
+      PrintMetric("exact_single_sided_neighbors_profiled",
+                  std::to_string(total_profile.exact_single_sided_neighbors));
+      PrintMetric("exact_internal_block_terms_profiled",
+                  std::to_string(total_profile.exact_internal_block_terms));
+      PrintMetric("exact_block_cost_evaluations_profiled",
+                  std::to_string(total_profile.exact_block_cost_evaluations));
+      PrintMetric("exact_capacity_multiplications_profiled",
+                  std::to_string(total_profile.exact_capacity_multiplications));
+      PrintMetric("candidate_index_build_ms_profiled",
+                  FormatDouble(total_profile.candidate_index_build_ms));
+      PrintMetric("candidate_index_refresh_ms_profiled",
+                  FormatDouble(total_profile.candidate_index_refresh_ms));
+      PrintMetric("candidate_proposal_ms_profiled",
+                  FormatDouble(total_profile.candidate_proposal_ms));
+      PrintMetric("candidate_proposals_raw_profiled",
+                  std::to_string(total_profile.candidate_proposals_raw));
+      PrintMetric("candidate_proposals_unique_profiled",
+                  std::to_string(total_profile.candidate_proposals_unique));
+      PrintMetric("candidate_duplicates_removed_profiled",
+                  std::to_string(total_profile.candidate_duplicates_removed));
+      PrintMetric("profiling_divide_ms",
+                  FormatDouble(runtime_profile.profiling_divide_ms));
+      PrintMetric("profiling_prepare_ms",
+                  FormatDouble(runtime_profile.profiling_prepare_ms));
+      PrintMetric("profiling_candidate_discovery_task_sum_ms",
+                  FormatDouble(
+                      runtime_profile.profiling_candidate_discovery_task_sum_ms));
+      PrintMetric("profiling_exact_gain_ms",
+                  FormatDouble(runtime_profile.profiling_exact_gain_ms));
+      PrintMetric("profiling_matching_ms",
+                  FormatDouble(runtime_profile.profiling_matching_ms));
+      PrintMetric("profiling_update_ms",
+                  FormatDouble(runtime_profile.profiling_update_ms));
+    }
+    if (!opts.profile_csv.empty()) {
+      if (opts.profiling_mode != ProfilingMode::kRounds) {
+        throw std::runtime_error(
+            "--profile-csv requires --profiling rounds so every row has an iteration.");
+      }
+      const std::vector<std::string> profile_columns = {
+          "dataset", "iteration", "algorithm", "profiling_mode",
+          "active_supernodes", "group_count", "sum_group_sizes",
+          "candidate_proxy_pairs_examined", "candidate_pairs_after_topk",
+          "candidate_pairs_submitted_for_scoring", "candidate_pairs_scored",
+          "exact_gain_calls", "exact_gain_positive_count",
+          "above_threshold_count", "matching_selected_count",
+          "actual_merge_count", "prepare_original_edges_scanned",
+          "prepare_aggregated_nnz", "exact_gain_input_nnz",
+          "update_partition_nodes_touched", "update_touched_quotient_entries",
+          "prepare_row_entries_copied", "prepare_row_copy_bytes",
+          "prepare_row_views_created", "prepare_unique_representatives",
+          "prepare_row_acquisition_requests", "prepare_row_acquisition_hits",
+          "prepare_row_acquisition_misses",
+          "prepare_duplicate_acquisitions_avoided",
+          "prepare_row_registry_entries", "prepare_row_registry_bytes",
+          "exact_persistent_pairs", "exact_raw_entries_a",
+          "exact_raw_entries_b", "exact_union_neighbors",
+          "exact_overlap_neighbors", "exact_single_sided_neighbors",
+          "exact_internal_block_terms", "exact_block_cost_evaluations",
+          "exact_capacity_multiplications",
+          "certification_candidates_seen", "upper_bound_pruned",
+          "upper_bound_passed", "early_abort_count",
+          "exact_full_scan_count", "exact_entries_available",
+          "exact_entries_scanned", "exact_entries_skipped",
+          "upper_bound_ms", "early_abort_exact_ms",
+          "candidate_index_build_ms", "candidate_index_refresh_ms",
+          "candidate_proposal_ms", "candidate_proposals_raw",
+          "candidate_proposals_unique", "candidate_duplicates_removed",
+          "candidate_budget_exhausted_nodes",
+          "candidate_nodes_with_zero_proposals",
+          "candidate_direct_neighbor_count", "candidate_shared_neighbor_count",
+          "candidate_exploration_count",
+          "quotient_row_lookup_ms",
+          "quotient_row_copy_ms", "quotient_exact_gain_ms",
+          "divide_ms", "prepare_ms",
+          "candidate_discovery_task_sum_ms", "exact_gain_ms", "matching_ms",
+          "update_ms"};
+      const std::string dataset = DatasetLabelFromPath(opts.input);
+      for (const IterationProfile& row : runtime_profile.rounds) {
+        AppendResultsCsv(opts.profile_csv, profile_columns,
+                         {dataset, std::to_string(row.iteration),
+                          opts.cost_objective == CostObjective::kLegacy
+                              ? "legacy_beam"
+                              : "beam_cost_oracle_reference",
+                          profiling_mode,
+                          std::to_string(row.active_supernodes),
+                          std::to_string(row.group_count),
+                          std::to_string(row.sum_group_sizes),
+                          std::to_string(row.candidate_proxy_pairs_examined),
+                          std::to_string(row.candidate_pairs_after_topk),
+                          std::to_string(row.candidate_pairs_submitted_for_scoring),
+                          std::to_string(row.candidate_pairs_scored),
+                          std::to_string(row.exact_gain_calls),
+                          std::to_string(row.exact_gain_positive_count),
+                          std::to_string(row.above_threshold_count),
+                          std::to_string(row.matching_selected_count),
+                          std::to_string(row.actual_merge_count),
+                          std::to_string(row.prepare_original_edges_scanned),
+                          std::to_string(row.prepare_aggregated_nnz),
+                          std::to_string(row.exact_gain_input_nnz),
+                          std::to_string(row.update_partition_nodes_touched),
+                          std::to_string(row.update_touched_quotient_entries),
+                          std::to_string(row.prepare_row_entries_copied),
+                          std::to_string(row.prepare_row_copy_bytes),
+                          std::to_string(row.prepare_row_views_created),
+                          std::to_string(row.prepare_unique_representatives),
+                          std::to_string(row.prepare_row_acquisition_requests),
+                          std::to_string(row.prepare_row_acquisition_hits),
+                          std::to_string(row.prepare_row_acquisition_misses),
+                          std::to_string(
+                              row.prepare_duplicate_acquisitions_avoided),
+                          std::to_string(row.prepare_row_registry_entries),
+                          std::to_string(row.prepare_row_registry_bytes),
+                          std::to_string(row.exact_persistent_pairs),
+                          std::to_string(row.exact_raw_entries_a),
+                          std::to_string(row.exact_raw_entries_b),
+                          std::to_string(row.exact_union_neighbors),
+                          std::to_string(row.exact_overlap_neighbors),
+                          std::to_string(row.exact_single_sided_neighbors),
+                          std::to_string(row.exact_internal_block_terms),
+                          std::to_string(row.exact_block_cost_evaluations),
+                          std::to_string(row.exact_capacity_multiplications),
+                          std::to_string(row.certification_candidates_seen),
+                          std::to_string(row.upper_bound_pruned),
+                          std::to_string(row.upper_bound_passed),
+                          std::to_string(row.early_abort_count),
+                          std::to_string(row.exact_full_scan_count),
+                          std::to_string(row.exact_entries_available),
+                          std::to_string(row.exact_entries_scanned),
+                          std::to_string(row.exact_entries_skipped),
+                          FormatDouble(row.upper_bound_ms),
+                          FormatDouble(row.early_abort_exact_ms),
+                          FormatDouble(row.candidate_index_build_ms),
+                          FormatDouble(row.candidate_index_refresh_ms),
+                          FormatDouble(row.candidate_proposal_ms),
+                          std::to_string(row.candidate_proposals_raw),
+                          std::to_string(row.candidate_proposals_unique),
+                          std::to_string(row.candidate_duplicates_removed),
+                          std::to_string(row.candidate_budget_exhausted_nodes),
+                          std::to_string(row.candidate_nodes_with_zero_proposals),
+                          std::to_string(row.candidate_direct_neighbor_count),
+                          std::to_string(row.candidate_shared_neighbor_count),
+                          std::to_string(row.candidate_exploration_count),
+                          FormatDouble(row.quotient_row_lookup_ms),
+                          FormatDouble(row.quotient_row_copy_ms),
+                          FormatDouble(row.quotient_exact_gain_ms),
+                          FormatDouble(row.divide_ms), FormatDouble(row.prepare_ms),
+                          FormatDouble(row.candidate_discovery_task_sum_ms),
+                          FormatDouble(row.exact_gain_ms),
+                          FormatDouble(row.matching_ms), FormatDouble(row.update_ms)});
+      }
+    }
+
     if (!opts.results_csv.empty()) {
       const std::vector<std::string> columns = {
           "n",
@@ -550,6 +1131,13 @@ int main(int argc, char** argv) {
           "merge_mode",
           "scoring_backend",
           "threshold_policy",
+          "cost_objective",
+          "state_backend",
+          "candidate_index",
+          "candidate_budget",
+          "certification",
+          "validate_quotient",
+          "quotient_update",
           "top_k",
           "group_batch_size",
           "candidate_batch_budget",
@@ -563,6 +1151,15 @@ int main(int argc, char** argv) {
           "Cm",
           "encoding_cost",
           "cost_ratio",
+          "num_superedges_nonloop",
+          "num_superedges_loop",
+          "num_positive_corrections",
+          "num_negative_corrections",
+          "encoding_cost_standard",
+          "cost_ratio_standard",
+          "encoding_cost_mags_x2",
+          "encoding_cost_mags_compatible",
+          "cost_ratio_mags_compatible",
           "compression_gain",
           "compression_java_style",
           "runtime_run_ms",
@@ -596,6 +1193,16 @@ int main(int argc, char** argv) {
           "merge_rejected_by_threshold",
           "merge_exact_gain_calls_per_selected",
           "merge_positive_gain_ratio",
+          "certification_candidates_seen",
+          "upper_bound_pruned",
+          "upper_bound_passed",
+          "early_abort_count",
+          "exact_full_scan_count",
+          "exact_entries_available",
+          "exact_entries_scanned",
+          "exact_entries_skipped",
+          "upper_bound_ms",
+          "early_abort_exact_ms",
           "threshold_last",
           "threshold_geom_last",
           "threshold_adaptive_last",
@@ -653,6 +1260,13 @@ int main(int argc, char** argv) {
           merge_mode,
           scoring_backend,
           threshold_policy,
+          CostObjectiveToString(opts.cost_objective),
+          StateBackendToString(opts.state_backend),
+          CandidateIndexModeToString(opts.candidate_index_mode),
+          std::to_string(opts.candidate_budget),
+          CertificationModeToString(opts.certification_mode),
+          opts.validate_quotient ? "true" : "false",
+          QuotientUpdateModeToString(opts.quotient_update_mode),
           std::to_string(opts.top_k),
           std::to_string(opts.group_batch_size),
           std::to_string(opts.candidate_batch_budget),
@@ -664,8 +1278,17 @@ int main(int argc, char** argv) {
           std::to_string(result.P.size()),
           std::to_string(result.Cp.size()),
           std::to_string(result.Cm.size()),
-          std::to_string(encoded_edges),
-          FormatDouble(cost_ratio),
+          std::to_string(compression_metrics.encoding_cost_standard),
+          FormatDouble(compression_metrics.cost_ratio_standard),
+          std::to_string(compression_metrics.num_superedges_nonloop),
+          std::to_string(compression_metrics.num_superedges_loop),
+          std::to_string(compression_metrics.num_positive_corrections),
+          std::to_string(compression_metrics.num_negative_corrections),
+          std::to_string(compression_metrics.encoding_cost_standard),
+          FormatDouble(compression_metrics.cost_ratio_standard),
+          std::to_string(compression_metrics.encoding_cost_mags_x2),
+          FormatDouble(compression_metrics.encoding_cost_mags_compatible),
+          FormatDouble(compression_metrics.cost_ratio_mags_compatible),
           FormatDouble(compression_gain),
           FormatDouble(compression_java_style),
           FormatDouble(stats.runtime_run_ms),
@@ -699,6 +1322,16 @@ int main(int argc, char** argv) {
           std::to_string(stats.merge_rejected_by_threshold),
           FormatDouble(stats.merge_exact_gain_calls_per_selected),
           FormatDouble(stats.merge_positive_gain_ratio),
+          std::to_string(stats.certification_candidates_seen),
+          std::to_string(stats.upper_bound_pruned),
+          std::to_string(stats.upper_bound_passed),
+          std::to_string(stats.early_abort_count),
+          std::to_string(stats.exact_full_scan_count),
+          std::to_string(stats.exact_entries_available),
+          std::to_string(stats.exact_entries_scanned),
+          std::to_string(stats.exact_entries_skipped),
+          FormatDouble(stats.upper_bound_ms),
+          FormatDouble(stats.early_abort_exact_ms),
           FormatDouble(stats.threshold_last),
           FormatDouble(stats.threshold_geom_last),
           FormatDouble(stats.threshold_adaptive_last),

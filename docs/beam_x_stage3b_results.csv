@@ -1,0 +1,7 @@
+experiment,path,budget,positive_recall,gain_weighted_recall,best_pair_recall,top1_exact_hit,top4_exact_recall,median_best_regret,p95_best_regret,exact_calls,merges,cost_ratio,algorithm_ms
+checkpoint60,quotient-neighbor,8,0.97392,0.960124,0.950000,0.150000,0.982759,0.000000,0.125000,,,,
+checkpoint60,residual-signature,4,0.681337,0.697557,1.000000,0.516667,0.978448,0.000000,0.000000,,,,
+FA,legacy,16,,,,,,,,274635,2346,0.483725,328.688803
+FA,residual-signature,4,,,,,,,,158451,2317,0.510619,549.619734
+FA_epoch1,legacy,16,,,,,,,,,17,,
+FA_epoch1,residual-signature,4,,,,,,,,,15,,
