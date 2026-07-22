@@ -1,86 +1,110 @@
-# BEAM C++ Prototype
+# BEAM / BEAM-X 图摘要原型
 
-`cpp/` 目录提供一个可运行的 SWeG C++ 原型，保留现有压缩核心与 merge/scoring 逻辑，当前支持：
+本仓库实现无向图的无损摘要算法 BEAM，并保留 BEAM-X 各阶段的实验路径。程序可输出：
 
-- `batch-ea`
-- `batch-ea-blocked`
+- supernode 划分；
+- superedge 集合 `P`；
+- positive corrections `Cp`；
+- negative corrections `Cm`；
+- `cost_ratio_mags_compatible` 等压缩指标；
+- runtime、候选漏斗、quotient graph 和 commit interaction 统计。
 
-默认目标：
+`error_bound=0.0` 时，输出可以无损恢复原始边集合。
 
-- 保持现有 `Encode` 语义不变
-- 可选输出兼容的 `G.txt / P.txt / Cp.txt / Cm.txt`
-- 在 `error_bound=0.0` 下保证可重建
-- 支持结构化指标输出和 `results.csv`
+## 当前项目状态
 
-## 构建
+当前推荐的 CPU reference 路径为：
 
-### 用 CMake
+```text
+MAGS-compatible CostOracle
++ Persistent QuotientGraph
++ legacy CandidateIndex
++ certification off
++ greedy full-batch commit (g0)
+```
+
+以下功能保留用于 A/B、profiling 和消融实验，但没有通过成为推荐默认路径的质量或性能门槛：
+
+| 功能 | 开关 | 当前结论 |
+|---|---|---|
+| Quotient-neighbor 候选 | `--candidate-index quotient-neighbor` | 候选减少，但压缩率明显下降 |
+| Residual-signature 候选 | `--candidate-index residual-signature` | checkpoint ranking 改善，但在线压缩率和 runtime 未通过 |
+| Safe certification | `--certification safe` | full exact scan 显著减少，但整体 runtime 未稳定改善 |
+| Transactional commit | `--commit-policy s1/t2/t4/t8/m4` | 可测得 interaction，但 FA/EM 压缩改善约为 0.01% |
+
+因此，正式复现实验应显式使用 `--candidate-index legacy --certification off --commit-policy g0`。
+
+详细阶段报告位于 `docs/`。
+
+## 依赖
+
+CPU 构建需要：
+
+- 支持 C++17 的编译器；
+- CMake 3.16 或更高版本；
+- OpenMP（建议安装，用于 CPU 并行）；
+- Python 3（仅测试和 lossless reconstruction 检查需要）。
+
+CUDA 路径还需要 CUDA Toolkit 和可用的 NVIDIA GPU。CUDA 不是当前推荐主线。
+
+## 编译
+
+所有命令均在仓库根目录执行。
+
+### CPU Release 构建
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSWEG_ENABLE_CUDA=OFF
+
 cmake --build build -j
 ```
 
-如需启用 CUDA scoring backend 构建骨架：
+生成的可执行文件为：
 
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSWEG_ENABLE_CUDA=ON
-cmake --build build -j
+```text
+build/beam
 ```
 
-### 没有 CMake 时直接用 g++
+### CUDA 构建
+
+```bash
+cmake -S . -B build_cuda \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSWEG_ENABLE_CUDA=ON
+
+cmake --build build_cuda -j
+```
+
+如果 CMake 找不到 CUDA 编译器，会给出警告并使用 CPU stub，而不是真实 CUDA scoring。
+
+### 不使用 CMake
 
 ```bash
 mkdir -p build_gpp
-g++ -std=c++17 -O3 -Iinclude \
-  src/main.cpp src/sweg.cpp src/scoring_cpu.cpp \
-  src/cuda_scoring_stub.cpp src/graph_io/graph_io.cpp \
+
+g++ -std=c++17 -O3 -DNDEBUG -fopenmp -Iinclude \
+  src/main.cpp \
+  src/sweg.cpp \
+  src/scoring_cpu.cpp \
+  src/candidate_index.cpp \
+  src/cost_oracle.cpp \
+  src/quotient_graph.cpp \
+  src/cuda_scoring_stub.cpp \
+  src/graph_io/graph_io.cpp \
   -o build_gpp/beam
+```
+
+查看程序实际支持的参数：
+
+```bash
+./build/beam --help
 ```
 
 ## 输入格式
 
-### CandidateIndex experimental path
-
-The Stage 3A proposal path is opt-in and currently requires persistent CPU
-state:
-
-```bash
---candidate-index quotient-neighbor --candidate-budget 8
-```
-
-`--candidate-index legacy` remains the default reference. The
-quotient-neighbor prototype reads only quotient rows and uses direct neighbors,
-bounded shared-neighbor expansion, and one deterministic exploration proposal.
-It is retained for A/B evaluation but is not yet a recommended quality default.
-
-Stage 3B also provides the experimental residual path:
-
-```bash
---candidate-index residual-signature --candidate-budget 4
-```
-
-Budget 4 is fixed to two residual proposals, one direct quotient neighbor, and
-one deterministic exploration proposal. This mode is diagnostic and is not a
-recommended default.
-
-程序只支持一种输入格式：
-
-- 普通文本无向 edge list
-- 每个非注释行包含两个整数：`u v`
-- 表示一条无向边 `{u, v}`
-- 每条无向边只出现一次
-- 程序内部会自动补成 `(u, v)` 和 `(v, u)` 两条 arc
-
-额外约束：
-
-- 跳过空行
-- 跳过以 `#` 开头的注释行
-- 不支持 self-loop，遇到 `u == v` 会报错
-- 不支持 header；不要把第一行写成 `n m`
-- 不要提供已经双向化的 edge list，否则边数会翻倍
-
-例如：
+程序读取普通文本无向单边 edge list：
 
 ```text
 0 1
@@ -88,698 +112,420 @@ recommended default.
 1 3
 ```
 
-程序内部会构建：
+要求：
 
-- `input_edges_raw = 3`
-- `graph_arcs = 6`
+- 每个非注释行包含两个整数 `u v`；
+- 每条无向边只出现一次；
+- 程序内部自动生成双向 CSR arcs；
+- 空行和以 `#` 开头的注释行会被跳过；
+- 不要添加 `n m` header；
+- 不支持 self-loop；
+- 不要输入已经双向化的边集合，否则边数会翻倍。
 
-## CLI 参数
+对于包含 `m` 条边的输入：
 
-当前 `beam` 支持的主要参数如下。
-
-本次 threshold policy 改动后，`batch-ea` / `batch-ea-blocked` 新增了一组可选阈值参数。
-如果你不传这些参数，默认行为仍然是旧版 reciprocal threshold，也就是：
-
-- `theta(t) = 1 / (1 + t)`
-- 对应 `--threshold-policy reciprocal`
-
-另外有几个实际重要的运行前提会明显影响结果或性能：
-
-- `batch-ea` 和 `batch-ea-blocked` 现在共用同一条 EA-proxy candidate generation 路径。
-- `--top-k <= 0` 不会禁用 candidate generation，程序仍会按至少 `1` 处理。
-- CPU 路径性能强依赖 OpenMP 线程环境；如果不显式设置 `OMP_NUM_THREADS`，性能可能和实验记录差很多。
-- `results.csv` 表头已经新增 threshold 相关字段；如果复用旧 CSV，程序会因为 schema 不匹配而拒绝追加写入。建议使用新文件名或先删除旧 CSV。
-
-### 基本参数
-
-- `--input <path>`
-  输入图路径。必填。
-
-- `--results-csv <path>`
-  将本次运行结果追加写入 CSV。
-
-- `--write-output`
-  显式写出 `G.txt / P.txt / Cp.txt / Cm.txt`。
-
-- `--out <dir>`
-  输出目录。只有和 `--write-output` 一起使用时才需要提供。
-
-- `--iterations <int>`
-  `Divide + Merge` 迭代次数。默认 `20`。
-
-- `--print-offset <int>`
-  每隔多少轮打印一次迭代日志。默认 `1`。
-
-- `--seed <int>`
-  随机种子。默认 `1`。
-
-- `--profiling <off|summary|rounds>`
-  Stage 0 legacy instrumentation 模式。默认 `off`。`summary` 在运行结束时输出全局
-  漏斗与 work counters；`rounds` 还会保留每轮记录。
-
-- `--profile-csv <path>`
-  将每轮 profile 写入稳定的 long-form CSV。必须与 `--profiling rounds` 一起使用；
-  算法运行期间不会同步写盘。
-
-阶段 0 的完整 profiling 与 overhead runner 位于：
-
-```bash
-bash tools/run_stage0_profiling.sh ./build/beam
-bash tools/run_stage0_overhead.sh ./build/beam
+```text
+input_edges_raw = m
+graph_arcs = 2m
+original_undirected_edges = m
 ```
 
-两个脚本采用固定的 seven-dataset/four-dataset 参数集，并分别写入
-`docs/beam_x_stage0_profile_*.csv` 和 `docs/beam_x_stage0_overhead.csv`。
+仓库实验数据默认位于：
 
-- `--divide-hash-dims <int>`
-  Adaptive Multi-Hash Divide 使用的独立 hash 维度数。默认 `16`。
-
-- `--divide-max-group <int>`
-  Adaptive Multi-Hash Divide 的目标最大 group 大小。默认 `512`。
-
-- `--error-bound <double>`
-  当前建议保持 `0.0`。默认 `0.0`。
-
-### Adaptive Multi-Hash Divide
-
-- `--divide-hash-dims`
-  Number of independent hash dimensions used by adaptive multi-hash divide.
-  Default: `16`.
-  Larger values provide more chances to split oversized groups, but may increase divide time.
-
-- `--divide-max-group`
-  Maximum target group size during adaptive divide.
-  Default: `512`.
-  Groups larger than this value are recursively split using additional hash dimensions.
-
-If these parameters are not provided, BEAM uses the default values.
-The existing `--seed` controls the deterministic randomness of the divide process.
-Using the same seed gives reproducible group construction.
-`--divide-max-group` is a hard cap on final divide group size. If all hash
-dimensions are exhausted and a bucket is still larger than this value, BEAM
-performs a deterministic fallback split using the existing seed and iteration
-number, so final groups remain reproducible and do not exceed the cap.
-
-### Merge 模式
-
-- `--merge-mode batch-ea`
-- `--merge-mode batch-ea-blocked`
-
-### batch-ea 相关参数
-
-- `--top-k <int>`
-  `batch-ea` / `batch-ea-blocked` 中每个 supernode 保留的 EA-proxy 候选数。默认 `16`。
-
-`batch-ea` 不再使用 SuperJaccard 作为 candidate proxy。
-当前 candidate generation 使用基于 `EncodeCostForPair` 风格局部代价模型的 encoding-aware proxy。
-`--top-k` 控制每个 supernode 在 exact scoring 之前保留多少个 EA-proxy candidate。
-如果传入 `0` 或负数，当前实现仍会按至少 `1` 处理，而不是禁用 candidate。
-
-- `--group-batch-size <int>`
-  仅对 `batch-ea-blocked` 有效。默认 `64`。
-
-- `--candidate-batch-budget <int>`
-  仅对 `batch-ea-blocked + --scoring-backend cuda` 有效。默认 `0`。
-  该参数只控制 CUDA exact-gain scoring 中 kernel chunk 的 candidate 数。
-  它不再参与 blocked prepare groups 或高层 scoring slice 的切分。
-
-- `--cuda-slice-memory-mb <int>`
-  仅对 `batch-ea-blocked + --scoring-backend cuda` 有效。默认 `0`。
-  `0` 表示自动模式；程序在 CUDA 初始化时只查询一次可用显存，并缓存一个保守 slice 预算。
-  `>0` 表示每个 blocked scoring slice 允许使用的最大估算 CUDA 内存 MiB。
-
-- `--overflow-group-gmax <int>`
-  大 group 的局部细化阈值。默认 `0`，表示关闭。
-
-- `--overflow-refine-rounds <int>`
-  overflow group 的最大细化轮数。默认 `0`。
-
-- `--ea-use-threshold`
-  对 `batch-ea` / `batch-ea-blocked` 有效，启用 local gain ratio threshold 过滤。
-
-- `--threshold-policy <reciprocal|mags-geom|adaptive>`
-  仅对 `batch-ea` / `batch-ea-blocked` 生效。默认 `reciprocal`。
-
-  - `reciprocal`
-    旧版行为，`theta(t) = 1 / (1 + t)`。
-  - `mags-geom`
-    MAGS-DM 几何阈值：
-    `high * pow(low / high, double(iter - 1) / double(T - 1))`。
-  - `adaptive`
-    使用上一轮采样到的 positive local gain ratio 分布，结合几何上界和 acceptance controller 自适应调节阈值。
-
-- `--threshold-high <double>`
-  `mags-geom` / `adaptive` 的几何阈值起点。默认 `0.5`。
-
-- `--threshold-low <double>`
-  `mags-geom` / `adaptive` 的几何阈值终点。默认 `0.005`。
-
-- `--threshold-min-low <double>`
-  `adaptive` 最终阈值下界。默认 `0.005`。
-  如果想探索更激进的 EA threshold，可设成 `0.001`。
-
-- `--adaptive-q-high <double>`
-  `adaptive` 第 1 轮使用的高分位数。默认 `0.85`。
-
-- `--adaptive-q-low <double>`
-  `adaptive` 后期轮次使用的低分位数。默认 `0.15`。
-
-- `--adaptive-sample-limit <int>`
-  `adaptive` reservoir sampling 的样本上限。默认 `4096`。
-
-- `--acceptance-target <double>`
-  `adaptive` acceptance controller 的目标接受率。默认 `0.15`。
-
-### threshold policy 说明
-
-`batch-ea` / `batch-ea-blocked` 在启用 `--ea-use-threshold` 时，会用 exact local gain ratio：
-
-- `saving_ratio = gain / before_cost`
-
-再结合 `--threshold-policy` 做过滤。
-
-如果没有传 `--ea-use-threshold`：
-
-- 仍然会输出 threshold 相关 metrics
-- 但 threshold 不参与 pair 过滤
-- 这时这些指标主要用于对照实验和日志记录
-
-`adaptive` 不会额外做一遍 prepass。
-第 `t` 轮使用第 `t-1` 轮记录到的 positive saving ratio 样本，并用 reservoir sampling 控制样本规模。
-
-### Scoring backend
-
-- `--scoring-backend cpu`
-  默认选项。建议配合 `OMP_NUM_THREADS` 使用。
-
-- `--scoring-backend cuda`
-  使用 CUDA scoring backend；当前主线 CUDA scoring 说明和 candidate batch 预算控制以 `batch-ea-blocked` 路径为准。若当前构建未启用真实 CUDA backend，则会报错或回退到 stub 能力边界。
-  当前 blocked CUDA 路径会先为一个 blocked scoring slice 构造 combined `FlatAggCSR`，
-  再把 candidates 按 `--candidate-batch-budget` 切成多个 kernel chunk。
-  V2 Commit 1 已经把 slice 规划从固定 `row_budget/nnz_budget`
-  改成按整块估算的自适应内存预算，并保持 slice 只能在完整 group 边界切分。
-
-- `--verify-cuda-gain`
-  调试检查开关，只增加校验，不改变最终压缩结果。
-
-CUDA metrics 说明：
-
-- `merge_prepare_wall_ms`
-  blocked prepare 的墙钟时间。由于 block 内 group prepare 可以并行，它通常小于 task_sum。
-- `merge_prepare_task_sum_ms`
-  各个 prepare task 时间的确定性累加和；并行时可能大于 wall time。
-- `cuda_row_h2d_ms`
-  resident CSR 上传时间。当前语义保留，用于兼容 V1 指标。
-- `cuda_pair_h2d_ms`
-  candidate pair chunk 的 H2D 时间。当前语义保留，用于兼容 V1 指标。
-- `cuda_kernel_ms`
-  candidate chunk kernel 时间。
-- `cuda_d2h_ms`
-  candidate chunk result 的 D2H 时间。当前语义保留，用于兼容 V1 指标。
-- `cuda_total_ms`
-  每次高层 `ScoreCandidatesCuda()` 调用的墙钟时间总和。
-- `cuda_init_ms`
-  CUDA cache/context 初始化开销。
-- `cuda_slice_count`
-  blocked CUDA 路径实际形成的 scoring slice 数。
-- `cuda_blocks_single_slice`
-  整个 block 可以作为单个 slice 提交的次数。
-- `cuda_blocks_multi_slice`
-  整个 block 需要拆成多个 slice 的次数。
-- `cuda_max_slice_rows`
-  观测到的单个 slice 最大 row 数。
-- `cuda_max_slice_nnz`
-  观测到的单个 slice 最大 nnz 数。
-- `cuda_max_slice_candidates`
-  观测到的单个 slice 最大 candidate 数。
-- `cuda_slice_memory_budget_bytes`
-  当前运行中用于 blocked CUDA 自适应 slice 的预算字节数。
-- `cuda_row_uploads`
-  resident CSR 上传次数。
-- `cuda_kernel_launches`
-  candidate chunk / kernel launch 次数。
-- `cuda_h2d_bytes`
-  H2D 总字节数，包含 resident CSR 和 candidate pairs。
-- `cuda_d2h_bytes`
-  result D2H 总字节数。
-
-由于两个 stream 可以 overlap，`cuda_row_h2d_ms + cuda_pair_h2d_ms + cuda_kernel_ms + cuda_d2h_ms`
-可能大于 `cuda_total_ms`。这表示阶段时间按 stream 累加，而 `cuda_total_ms` 是墙钟时间。
-
-## 使用方式（运行命令）
-
-### 批量运行多个数据集（自动化命令）
-
-如果需要批量在多个数据集上运行，可以参考以下 bash 脚本：
-
-```bash
-THREADS=40
-BEAM=./build/beam
-DATA=/data/zby/datasets
-
-MODE=batch-ea
-BACKEND=cpu
-TOPK=32
-ITERS=20
-SEED=1
-ERROR_BOUND=0.0
-
-DIVIDE_HASH_DIMS=16
-DIVIDE_MAX_GROUP=512
-
-LOG=./logs_beam_ea_proxy_${MODE}_it${ITERS}_th${THREADS}_topk${TOPK}
-CSV_DIR=./results/beam_ea_proxy_${MODE}_it${ITERS}_th${THREADS}_topk${TOPK}
-
-mkdir -p "$LOG" "$CSV_DIR"
-
-export OMP_NUM_THREADS=$THREADS
-export OMP_PROC_BIND=close
-export OMP_PLACES=cores
-
-for item in \
-  "facebook|$DATA/facebook/facebook.undir.single.txt" \
-  "caida|$DATA/caida/caida.undir.single.txt" \
-  "email_enron|$DATA/email_enron/email_enron.undir.single.txt" \
-  "amazon|$DATA/amazon/amazon.undir.single.txt" \
-  "dblp|$DATA/dblp/dblp.undir.single.txt"
-do
-  IFS="|" read -r name input <<< "$item"
-
-  log_file="$LOG/${name}.log"
-  csv_file="$CSV_DIR/${name}.csv"
-
-  rm -f "$csv_file"
-
-  echo "===== ${name} start $(date) =====" | tee "$log_file"
-  echo "input=${input}" | tee -a "$log_file"
-  echo "csv=${csv_file}" | tee -a "$log_file"
-  echo "threads=${THREADS}, mode=${MODE}, backend=${BACKEND}, topk=${TOPK}, iterations=${ITERS}, seed=${SEED}" | tee -a "$log_file"
-  echo "divide_hash_dims=${DIVIDE_HASH_DIMS}, divide_max_group=${DIVIDE_MAX_GROUP}" | tee -a "$log_file"
-
-  /usr/bin/time -v "$BEAM" \
-    --input "$input" \
-    --merge-mode "$MODE" \
-    --scoring-backend "$BACKEND" \
-    --top-k "$TOPK" \
-    --ea-use-threshold \
-    --threshold-policy reciprocal \
-    --iterations "$ITERS" \
-    --seed "$SEED" \
-    --divide-hash-dims "$DIVIDE_HASH_DIMS" \
-    --divide-max-group "$DIVIDE_MAX_GROUP" \
-    --error-bound "$ERROR_BOUND" \
-    --results-csv "$csv_file" \
-    2>&1 | tee -a "$log_file"
-
-  status=${PIPESTATUS[0]}
-
-  echo "exit_status=${status}" | tee -a "$log_file"
-  echo "===== ${name} end $(date) =====" | tee -a "$log_file"
-  echo ""
-done
-
+```text
+../../datasets/
 ```
 
+例如：
 
-
-### 单个数据集运行示例
-
-对当前主线算法，`batch-ea` 最常用、也是推荐的最小必要参数集合是：
-
-```bash
-./build/beam \
-  --input <graph> \
-  --merge-mode batch-ea \
-  --scoring-backend cpu \
-  --top-k 16 \
-  --ea-use-threshold \
-  --threshold-policy reciprocal \
-  --iterations 20 \
-  --seed 1 \
-  --error-bound 0.0
+```text
+../../datasets/facebook/facebook.undir.single.txt
+../../datasets/email_enron/email_enron.undir.single.txt
+../../datasets/amazon/amazon.undir.single.txt
+../../datasets/dblp/dblp.undir.single.txt
+../../datasets/youtube/youtube.undir.single.txt
+../../datasets/roadnet/roadnet.undir.single.txt
+../../datasets/livejournal/livejournal.undir.single.txt
 ```
 
-其中真正重要的项是：
+## 推荐运行方式
 
-- `--merge-mode batch-ea`
-- `--scoring-backend cpu` 或 `cuda`
-- `--top-k`
-- `--ea-use-threshold`
-- `--threshold-policy`
-- `--iterations`
-- `--seed`
+### 设置 CPU 线程
 
-如果你要复现实验中的 CPU 性能，通常还需要显式设置：
+正式运行前建议显式固定 OpenMP 配置：
 
 ```bash
-export OMP_NUM_THREADS=<threads>
+export OMP_NUM_THREADS=24
 export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 ```
 
-这些不是 BEAM 的 CLI 参数，但对运行速度非常重要。
+线程数应根据机器的物理核心数调整。比较实验必须记录相同的线程数和 affinity。
 
-正式实验默认不写 `G/P/Cp/Cm`，也不需要 `--out`：
+### 当前推荐 CPU reference 配置
 
 ```bash
+mkdir -p results
+
 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
-  --merge-mode batch-ea \
-  --scoring-backend cpu \
-  --top-k 4 \
-  --ea-use-threshold \
-  --threshold-policy reciprocal \
-  --iterations 20 \
-  --seed 1 \
-  --error-bound 0.0 \
-  --results-csv results.csv
-```
-
-一个完整示例：
-
-```bash
-OMP_NUM_THREADS=40 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
-  --merge-mode batch-ea \
-  --scoring-backend cpu \
-  --top-k 4 \
-  --ea-use-threshold \
-  --threshold-policy reciprocal \
-  --iterations 20 \
-  --seed 1 \
-  --error-bound 0.0 \
-  --results-csv results/sweg_batch_ea.csv
-```
-
-如果需要切到 MAGS-DM 几何阈值：
-
-```bash
-OMP_NUM_THREADS=40 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
-  --merge-mode batch-ea \
-  --scoring-backend cpu \
-  --top-k 4 \
-  --ea-use-threshold \
-  --threshold-policy mags-geom \
-  --threshold-high 0.5 \
-  --threshold-low 0.005 \
-  --iterations 20 \
-  --seed 1 \
-  --error-bound 0.0 \
-  --results-csv results/beam_batch_ea_mags_geom.csv
-```
-
-如果需要切到 adaptive threshold：
-
-```bash
-OMP_NUM_THREADS=40 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
-  --merge-mode batch-ea \
-  --scoring-backend cpu \
-  --top-k 4 \
-  --ea-use-threshold \
-  --threshold-policy adaptive \
-  --threshold-high 0.5 \
-  --threshold-low 0.005 \
-  --threshold-min-low 0.005 \
-  --adaptive-q-high 0.85 \
-  --adaptive-q-low 0.15 \
-  --adaptive-sample-limit 4096 \
-  --acceptance-target 0.15 \
-  --iterations 20 \
-  --seed 1 \
-  --error-bound 0.0 \
-  --results-csv results/beam_batch_ea_adaptive.csv
-```
-
-如果你要跑 `batch-ea-blocked`：
-
-```bash
-OMP_NUM_THREADS=40 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
+  --input ../../datasets/facebook/facebook.undir.single.txt \
   --merge-mode batch-ea-blocked \
   --scoring-backend cpu \
-  --top-k 4 \
+  --cost-objective mags-compatible \
+  --state-backend persistent \
+  --quotient-update incremental \
+  --candidate-index legacy \
+  --certification off \
+  --commit-policy g0 \
+  --top-k 16 \
   --group-batch-size 64 \
   --ea-use-threshold \
-  --threshold-policy adaptive \
+  --threshold-policy reciprocal \
   --iterations 20 \
+  --print-offset 0 \
   --seed 1 \
   --error-bound 0.0 \
-  --results-csv results/beam_batch_ea_blocked_adaptive.csv
+  --profiling summary \
+  --results-csv results/facebook.csv
 ```
 
-如果需要写出 `G/P/Cp/Cm` 文件：
+注意：程序自身默认仍保留 legacy objective 和 legacy state，便于历史 A/B。要运行 BEAM-X reference，必须显式传入上面的 objective、state 和算法开关。
+
+### 输出摘要并验证无损恢复
 
 ```bash
-OMP_NUM_THREADS=40 ./build/beam \
-  --input data/facebook/facebook_combined.txt \
-  --merge-mode batch-ea \
+mkdir -p outputs/facebook
+
+./build/beam \
+  --input ../../datasets/facebook/facebook.undir.single.txt \
+  --merge-mode batch-ea-blocked \
   --scoring-backend cpu \
-  --top-k 4 \
+  --cost-objective mags-compatible \
+  --state-backend persistent \
+  --quotient-update incremental \
+  --candidate-index legacy \
+  --certification off \
+  --commit-policy g0 \
+  --top-k 16 \
+  --group-batch-size 64 \
   --ea-use-threshold \
   --threshold-policy reciprocal \
   --iterations 20 \
   --seed 1 \
-  --divide-hash-dims 16 \
-  --divide-max-group 512 \
   --error-bound 0.0 \
   --write-output \
-  --out out/facebook \
-  --results-csv results/sweg_batch_ea.csv
+  --out outputs/facebook
+
+python3 tools/check_reconstruction.py \
+  --graph ../../datasets/facebook/facebook.undir.single.txt \
+  --compressed outputs/facebook
 ```
 
-最小运行示例：
+摘要目录包含：
 
-```bash
-./beam --input <path> --seed 1
+```text
+G.txt
+P.txt
+Cp.txt
+Cm.txt
 ```
 
-这个命令能运行，但它不会显式锁定你真正关心的 merge 模式、backend 和 top-k。
-如果是做 `batch-ea` 实验，不建议只用这一条最小命令。
+正式 algorithm runtime 不建议包含写盘时间；只有需要检查 payload 时才使用 `--write-output`。
 
-带 divide 参数的示例：
-
-```bash
-./beam --input <path> --seed 1 --divide-hash-dims 16 --divide-max-group 512
-```
-
-如果传了 `--write-output` 但没有传 `--out`，程序会直接报错。
-
-## 计时字段
-
-程序输出以下时间字段：
-
-- `runtime_run_ms`
-  `Sweg::Run()` 的总时间，也就是 `divide + merge`。
-
-- `runtime_divide_ms`
-  `Divide()` 累计时间。
-
-- `runtime_merge_ms`
-  `Merge()` 累计时间。
-
-- `divide_max_group_size`
-  最终 divide groups 的最大大小。启用 hard cap 后应不超过 `--divide-max-group`。
-
-- `divide_fallback_splits`
-  Adaptive Multi-Hash Divide 在 hash 维度耗尽后触发 deterministic fallback split 的次数。
-
-- `runtime_encode_ms`
-  `Encode()` 时间。
-
-- `runtime_output_ms`
-  `WriteOutput()` 时间。默认不写输出时为 `0`。
-
-- `runtime_algorithm_ms`
-  `runtime_run_ms + runtime_encode_ms`。
-  正式与 MAGS 对比时使用这个字段。
-
-- `runtime_end_to_end_ms`
-  `runtime_algorithm_ms + runtime_output_ms`。
-  只有显式写输出时才会大于 `runtime_algorithm_ms`。
-
-默认不写输出文件，因此：
-
-- `runtime_output_ms = 0`
-- 正式实验时间使用 `runtime_algorithm_ms`
-
-如果显式开启 `--write-output`：
-
-- 会生成 `G.txt / P.txt / Cp.txt / Cm.txt`
-- `runtime_end_to_end_ms = runtime_algorithm_ms + runtime_output_ms`
-
-如果你修改了 `results.csv` 表头，旧 CSV 文件会因为 schema 不匹配而报错。
-建议删除旧 CSV，或使用新的文件名。
-
-## threshold 相关指标
-
-现在的 metrics / CSV 中额外包含以下 threshold 字段：
-
-- `threshold_policy`
-  当前实验使用的 threshold policy 名称。
-
-- `threshold_last`
-  最后一轮实际使用的阈值。
-
-- `threshold_geom_last`
-  最后一轮几何阈值。
-
-- `threshold_adaptive_last`
-  最后一轮 adaptive 分位数阈值。
-  对 `reciprocal` / `mags-geom`，这个值会退化成对应主阈值。
-
-- `threshold_acceptance_scale`
-  `adaptive` acceptance controller 在最后一轮结束后的缩放因子。
-
-- `threshold_acceptance_rate_last`
-  最后一轮记录到的 acceptance rate。
-
-- `threshold_sample_count_last`
-  最后一轮结束后保留下来的 sampled positive saving ratio 个数。
-
-## 批量运行
-
-正式实验如果不需要写 `G/P/Cp/Cm`，不要传 `--write-output`，也不需要 `--out`：
+## 批量运行七个数据集
 
 ```bash
-THREADS=40
-SWEG=./build/beam
-DATA=/data/zby/datasets
-
-MODE=batch-ea
-BACKEND=cpu
-TOPK=4
-ITERS=20
-SEED=1
-ERROR_BOUND=0.0
-
-LOG=./logs_sweg_${MODE}_th${THREADS}
-CSV=./results/sweg_${MODE}_th${THREADS}.csv
-
-mkdir -p "$LOG" "$(dirname "$CSV")"
-
-export OMP_NUM_THREADS=$THREADS
+export OMP_NUM_THREADS=24
 export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 
+BEAM=./build/beam
+DATA=../../datasets
+RESULTS=results/beam_x_reference.csv
+
+mkdir -p results logs
+
 for item in \
-  "facebook|$DATA/facebook/facebook.undir.single.txt" \
-  "caida|$DATA/caida/caida.undir.single.txt" \
-  "email_enron|$DATA/email_enron/email_enron.undir.single.txt" \
-  "amazon|$DATA/amazon/amazon.undir.single.txt" \
-  "dblp|$DATA/dblp/dblp.undir.single.txt"
+  "FA|$DATA/facebook/facebook.undir.single.txt" \
+  "EM|$DATA/email_enron/email_enron.undir.single.txt" \
+  "AM|$DATA/amazon/amazon.undir.single.txt" \
+  "DB|$DATA/dblp/dblp.undir.single.txt" \
+  "YO|$DATA/youtube/youtube.undir.single.txt" \
+  "RN|$DATA/roadnet/roadnet.undir.single.txt" \
+  "LJ|$DATA/livejournal/livejournal.undir.single.txt"
 do
-  IFS="|" read -r name input <<< "$item"
+  IFS='|' read -r name input <<< "$item"
 
-  log_file="$LOG/${name}.log"
-
-  echo "===== ${name} start $(date) =====" | tee "$log_file"
-  echo "input=${input}" | tee -a "$log_file"
-  echo "csv=${CSV}" | tee -a "$log_file"
-
-  /usr/bin/time -v "$SWEG" \
+  "$BEAM" \
     --input "$input" \
-    --merge-mode "$MODE" \
-    --scoring-backend "$BACKEND" \
-    --top-k "$TOPK" \
+    --merge-mode batch-ea-blocked \
+    --scoring-backend cpu \
+    --cost-objective mags-compatible \
+    --state-backend persistent \
+    --quotient-update incremental \
+    --candidate-index legacy \
+    --certification off \
+    --commit-policy g0 \
+    --top-k 16 \
+    --group-batch-size 64 \
     --ea-use-threshold \
     --threshold-policy reciprocal \
-    --iterations "$ITERS" \
-    --seed "$SEED" \
-    --error-bound "$ERROR_BOUND" \
-    --results-csv "$CSV" \
-    2>&1 | tee -a "$log_file"
-
-  status=${PIPESTATUS[0]}
-
-  echo "exit_status=${status}" | tee -a "$log_file"
-  echo "===== ${name} end $(date) =====" | tee -a "$log_file"
-  echo ""
+    --iterations 20 \
+    --print-offset 0 \
+    --seed 1 \
+    --error-bound 0.0 \
+    --profiling summary \
+    --results-csv "$RESULTS" \
+    > "logs/${name}.log"
 done
 ```
 
+如果 CSV 已存在但 schema 与当前版本不同，程序会拒绝追加。此时请使用新文件名或先移动旧 CSV。
 
+## 主要参数
 
-## 指标口径
+### 基本运行参数
 
-对于输入无向单边 edge list：
+| 参数 | 含义 | 默认值 |
+|---|---|---:|
+| `--input <path>` | 输入 edge list，必填 | 无 |
+| `--iterations <int>` | Divide + Merge 轮数 | `20` |
+| `--seed <int>` | 随机种子 | `1` |
+| `--print-offset <int>` | 每隔多少轮打印一次 | `1` |
+| `--error-bound <double>` | 丢边比例，`0.0` 为 lossless | `0.0` |
+| `--results-csv <path>` | 追加一行结构化结果 | 不写 |
+| `--write-output` | 生成 `G/P/Cp/Cm` | 关闭 |
+| `--out <dir>` | 摘要输出目录 | 无 |
 
-- `metric.input_edges_raw = m`
-- `metric.graph_arcs = 2m`
-- `metric.original_undirected_edges = m`
-- `metric.original_edges_eval = m`
+`--write-output` 必须与 `--out` 一起使用。
 
-压缩率口径保持不变：
+### 算法与状态
 
-- `encoding_cost = |P| + |Cp| + |Cm|`
-- `cost_ratio = encoding_cost / original_edges_eval`
-- `compression_gain = 1 - cost_ratio`
+| 参数 | 可选值 | 默认值 |
+|---|---|---:|
+| `--merge-mode` | `batch-ea`, `batch-ea-blocked` | `batch-ea` |
+| `--scoring-backend` | `cpu`, `cuda` | `cpu` |
+| `--cost-objective` | `legacy`, `mags-compatible` | `legacy` |
+| `--state-backend` | `legacy`, `persistent` | `legacy` |
+| `--quotient-update` | `incremental`, `bulk_rebuild`, `auto` | `incremental` |
+| `--top-k <int>` | 每个 supernode 的 EA-proxy top-k | `16` |
+| `--group-batch-size <int>` | blocked 模式每批 group 数 | `64` |
+| `--divide-hash-dims <int>` | divide hash 维数 | `16` |
+| `--divide-max-group <int>` | divide group 大小上限 | `512` |
 
-为与当前 MAGS 实现直接比较，BEAM 还报告一个仅影响评估的兼容指标。令
-`P_nonloop` 和 `P_loop` 分别为非自环和自环 superedge：
+`mags-compatible` 当前只支持 CPU scoring。`--validate-quotient` 会在 merge 后用原图重建检查，仅用于小图调试。
 
-- `cost_ratio_standard = (|P_nonloop| + |P_loop| + |Cp| + |Cm|) / m`
-- `cost_ratio_mags_compatible = (2|P_nonloop| + |P_loop| + 2|Cp| + 2|Cm|) / (2m)`
-- 等价地，`cost_ratio_mags_compatible = (|P_nonloop| + 0.5|P_loop| + |Cp| + |Cm|) / m`
+### Threshold
 
-### Stage 1 CostOracle reference path
-
-默认的 `--cost-objective legacy` 保留上述历史 payload 统计和 merge 行为，便于与
-Stage 0 冻结基线 A/B 对照。Stage 1B 增加 CPU-only reference path：
-
-```bash
-beam --input graph.txt --scoring-backend cpu \
-  --cost-objective mags-compatible
-```
-
-该模式以整数 block objective
-`min(edges, 1 + capacity - edges)` 统一 exact merge、最终 partition cost 和
-encoding materialization。内部 block 的无向边与 correction 只物化一次，因此该模式
-输出的 `encoding_cost_mags_compatible` 为整数，并与 `exact_partition_cost` 完全相等。
-此 reference path 会在每次 commit 前从当前 partition 完整重算 merge gain；它用于
-Stage 1 correctness gate，不是性能实现。Stage 2 将用持久化 quotient state 替换这次
-完整重算。CUDA 暂不支持这一新 objective，显式请求会报错而不是混用 legacy kernel。
-
-### Stage 2 persistent quotient state
-
-Stage 2 提供独立 state backend，默认仍保留 legacy：
+启用 threshold：
 
 ```bash
-beam --input graph.txt --state-backend persistent \
-  --quotient-update auto
+--ea-use-threshold --threshold-policy reciprocal
 ```
 
-更新策略包括 `incremental`、`bulk_rebuild` 和 `auto`。`incremental` 使用 sorted
-flat quotient rows；`bulk_rebuild` 从当前 quotient edge stream 重聚合，不扫描原始
-图；`auto` 只有在单个 commit batch 减少至少 5% active supernodes 且估计增量工作
-超过当前 quotient NNZ 时才重建。当前 legacy scheduler 的 batch 较小，因此 auto
-通常选择 incremental。
+支持：
 
-`--validate-quotient` 是小图/debug 开关，每次 commit 后从原图完整重建并核对状态和
-exact cost。它要求 persistent backend，不应在正式性能实验中启用。
+- `reciprocal`：`theta(t) = 1 / (1 + t)`；
+- `mags-geom`：从 `threshold-high` 到 `threshold-low` 的几何衰减；
+- `adaptive`：根据上一轮 positive saving ratio 样本自适应调整。
 
-### Stage 4A safe certification
+相关参数：
 
-`--certification safe` 为 persistent CPU MAGS-compatible 路径启用可证明安全的
-upper-bound pruning 和 threshold-aware exact early abort；默认值为 `off`。该模式
-要求 `--candidate-index legacy`，不改变候选顺序或 logical `merge_exact_gain_calls`。
-避免的 exact 工作使用 `exact_full_scan_count`、`exact_entries_scanned` 和
-`exact_entries_skipped` 统计。
+| 参数 | 默认值 |
+|---|---:|
+| `--threshold-high` | `0.5` |
+| `--threshold-low` | `0.005` |
+| `--threshold-min-low` | `0.005` |
+| `--adaptive-q-high` | `0.85` |
+| `--adaptive-q-low` | `0.15` |
+| `--adaptive-sample-limit` | `4096` |
+| `--acceptance-target` | `0.15` |
 
-其中 `encoding_cost_mags_x2` 是上述兼容成本的两倍整数值，
-`encoding_cost_mags_compatible = encoding_cost_mags_x2 / 2`。该兼容指标只改变
-报告口径；不会改变 BEAM 的优化目标、分区或生成的 `P`、`Cp`、`Cm`。
+## 实验和调试开关
 
-因此在当前唯一输入格式下：
-
-- `relative_size == cost_ratio`
-
-## 测试脚本
-
-仓库内的小图测试脚本会显式传 `--write-output --out ...`，因为 reconstruction 需要读取 `G/P/Cp/Cm`：
+### CandidateIndex 消融
 
 ```bash
-python3 cpp/tools/run_small_tests.py \
-  --binary cpp/build/beam
+--candidate-index legacy
+--candidate-index quotient-neighbor --candidate-budget 8
+--candidate-index residual-signature --candidate-budget 4
 ```
+
+后两种模式要求 persistent CPU state，只用于消融，不推荐替代 legacy reference。
+
+### Safe certification 消融
+
+```bash
+--cost-objective mags-compatible \
+--state-backend persistent \
+--scoring-backend cpu \
+--candidate-index legacy \
+--certification safe
+```
+
+该路径提供 safe upper bound 和 exact early abort。逻辑 exact request 数仍记录在 `merge_exact_gain_calls`，真正完整扫描数记录在 `exact_full_scan_count`。
+
+### Commit policy 消融
+
+支持：
+
+| Policy | 含义 |
+|---|---|
+| `g0` | 当前 greedy endpoint-disjoint full batch，推荐 reference |
+| `s1` | 固定候选图，逐 pair current-state validation |
+| `t2` | transactional micro-batch 2 |
+| `t4` | transactional micro-batch 4 |
+| `t8` | transactional micro-batch 8 |
+| `m4` | mutual-best 优先 + transactional batch 4 |
+
+启用 exact-cost trajectory audit：
+
+```bash
+--commit-policy t4 \
+--commit-audit \
+--commit-audit-csv results/commit_trajectory.csv
+```
+
+`--commit-audit` 会调用额外的 exact quotient cost 检查。其开销单独记录为 `audit_oracle_ms`，不能作为生产 runtime。
+
+### Profiling
+
+```bash
+--profiling off
+--profiling summary
+--profiling rounds --profile-csv results/profile_rounds.csv
+```
+
+- `off`：不保留逐轮 profile；
+- `summary`：输出全局计数和阶段时间；
+- `rounds`：额外保存每轮长格式 CSV；
+- `--profile-csv` 必须与 `--profiling rounds` 一起使用。
+
+Stage 0 runner：
+
+```bash
+bash tools/run_stage0_overhead.sh ./build/beam
+bash tools/run_stage0_profiling.sh ./build/beam
+```
+
+脚本会写入 `docs/`，不要用于覆盖已冻结的 Stage 0 artifacts。
+
+## 输出指标
+
+正式压缩比较必须使用：
+
+```text
+cost_ratio_mags_compatible
+```
+
+不要使用 `cost_ratio` 或 `cost_ratio_standard` 替代正式 MAGS-compatible 结果。
+
+无向图的兼容成本定义为：
+
+```text
+cost_ratio_mags_compatible
+= (|P_nonloop| + 0.5 * |P_loop| + |Cp| + |Cm|) / m
+```
+
+程序同时输出 `encoding_cost_mags_x2`，用整数保存两倍兼容成本，避免浮点歧义。
+
+### Runtime
+
+| 字段 | 含义 |
+|---|---|
+| `runtime_run_ms` | `Sweg::Run()`，包含 divide 和 merge |
+| `runtime_divide_ms` | Divide 累计时间 |
+| `runtime_merge_ms` | Merge 累计时间 |
+| `runtime_encode_ms` | 最终 encoding materialization 时间 |
+| `runtime_output_ms` | `G/P/Cp/Cm` 写盘时间 |
+| `runtime_algorithm_ms` | `runtime_run_ms + runtime_encode_ms` |
+| `runtime_end_to_end_ms` | algorithm + output |
+
+正式与 MAGS-DM 比较使用 `runtime_algorithm_ms`，不包含读图和写盘。
+
+### 搜索和 commit
+
+重点字段包括：
+
+```text
+merge_exact_gain_calls
+merge_selected_pairs
+exact_gain_input_nnz
+exact_full_scan_count
+exact_entries_scanned
+exact_entries_skipped
+isolated_gain_sum
+realized_marginal_gain_sum
+interaction_delta
+negative_marginal
+validation_exact_calls
+commit_validation_ms
+audit_oracle_ms
+partition_hash
+```
+
+## 测试
+
+### CTest
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+包含 CostOracle、compression metrics、QuotientGraph、row view、CandidateIndex 和 Python integration tests。
+
+### 小图 lossless 测试
+
+```bash
+python3 tools/run_small_tests.py \
+  --binary ./build/beam
+```
+
+### 单独验证已有摘要
+
+```bash
+python3 tools/check_reconstruction.py \
+  --graph tests/two_communities6.edgelist \
+  --compressed outputs/two_communities
+```
+
+## 冻结结果与设计文档
+
+关键报告包括：
+
+```text
+docs/beam_x_baseline.md
+docs/beam_x_stage0_profile.md
+docs/beam_x_stage1a_cost_oracle.md
+docs/beam_x_stage1b_cost_oracle_integration.md
+docs/beam_x_stage2_task5_exact_kernel.md
+docs/beam_x_stage3a_candidate_index.md
+docs/beam_x_stage3b_residual_signature.md
+docs/beam_x_stage4a_safe_certification.md
+docs/beam_x_stage5a_commit_policy_design.md
+docs/beam_x_stage5a_commit_policy_results.md
+```
+
+验证 Stage 0/1 冻结文件：
+
+```bash
+sha256sum -c docs/beam_x_stage0_freeze.sha256
+sha256sum -c docs/beam_x_stage1_freeze.sha256
+```
+
+## 可复现性记录
+
+正式实验应同时记录：
+
+- git commit hash；
+- build type；
+- compiler 和版本；
+- compile flags；
+- CPU 型号；
+- `OMP_NUM_THREADS`；
+- `OMP_PROC_BIND` / `OMP_PLACES`；
+- GPU 和 CUDA 版本；
+- 完整参数；
+- 随机种子。
+
+Stage 0 的冻结环境与七数据集基线见 `docs/beam_x_baseline.md`。
