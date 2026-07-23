@@ -235,24 +235,28 @@ Cm.txt
 ## 批量运行七个数据集
 
 ```bash
-export OMP_NUM_THREADS=24
+export OMP_NUM_THREADS=40
 export OMP_PROC_BIND=close
 export OMP_PLACES=cores
 
 BEAM=./build/beam
-DATA=../../datasets
-RESULTS=results/beam_x_reference.csv
+DATA=/data/zby/datasets
+RESULTS=results/beam_x_cpu.csv
 
 mkdir -p results logs
 
 for item in \
-  "FA|$DATA/facebook/facebook.undir.single.txt" \
-  "EM|$DATA/email_enron/email_enron.undir.single.txt" \
-  "AM|$DATA/amazon/amazon.undir.single.txt" \
-  "DB|$DATA/dblp/dblp.undir.single.txt" \
-  "YO|$DATA/youtube/youtube.undir.single.txt" \
-  "RN|$DATA/roadnet/roadnet.undir.single.txt" \
-  "LJ|$DATA/livejournal/livejournal.undir.single.txt"
+    "facebook|$DATA/facebook/facebook.undir.single.txt" \
+    "email_enron|$DATA/email_enron/email_enron.undir.single.txt" \
+    "amazon|$DATA/amazon/amazon.undir.single.txt" \
+    "dblp|$DATA/dblp/dblp.undir.single.txt" \
+    "youtube|$DATA/youtube/youtube.undir.single.txt" \
+    "roadnet|$DATA/roadnet/roadnet.undir.single.txt" \
+    "livejournal|$DATA/livejournal/livejournal.undir.single.txt" \
+    "hollywood|$DATA/hollywood/hollywood.undir.single.txt" \
+    "orkut|$DATA/orkut/orkut.undir.single.txt" \
+    "uk-2002|$DATA/uk-2002/uk-2002.undir.single.txt" \
+    "uk-2005|$DATA/uk-2005/uk-2005.undir.single.txt"
 do
   IFS='|' read -r name input <<< "$item"
 
@@ -281,6 +285,62 @@ done
 ```
 
 如果 CSV 已存在但 schema 与当前版本不同，程序会拒绝追加。此时请使用新文件名或先移动旧 CSV。
+
+
+
+cuda模式
+
+```bash
+export OMP_NUM_THREADS=40
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+
+BEAM=./build_cuda/beam
+DATA=/data/zby/datasets
+RESULTS=results/beam_x_cuda.csv
+
+mkdir -p results logs
+
+for item in \
+    "facebook|$DATA/facebook/facebook.undir.single.txt" \
+    "email_enron|$DATA/email_enron/email_enron.undir.single.txt" \
+    "amazon|$DATA/amazon/amazon.undir.single.txt" \
+    "dblp|$DATA/dblp/dblp.undir.single.txt" \
+    "youtube|$DATA/youtube/youtube.undir.single.txt" \
+    "roadnet|$DATA/roadnet/roadnet.undir.single.txt" \
+    "livejournal|$DATA/livejournal/livejournal.undir.single.txt" \
+    "hollywood|$DATA/hollywood/hollywood.undir.single.txt" \
+    "orkut|$DATA/orkut/orkut.undir.single.txt" \
+    "uk-2002|$DATA/uk-2002/uk-2002.undir.single.txt" \
+    "uk-2005|$DATA/uk-2005/uk-2005.undir.single.txt"
+do
+  IFS='|' read -r name input <<< "$item"
+
+  "$BEAM" \
+    --input "$input" \
+    --merge-mode batch-ea-blocked \
+    --scoring-backend cuda \
+    --cost-objective legacy \
+    --state-backend persistent \
+    --quotient-update incremental \
+    --candidate-index legacy \
+    --certification off \
+    --commit-policy g0 \
+    --top-k 16 \
+    --group-batch-size 64 \
+    --ea-use-threshold \
+    --threshold-policy reciprocal \
+    --iterations 20 \
+    --print-offset 0 \
+    --seed 1 \
+    --error-bound 0.0 \
+    --profiling summary \
+    --results-csv "$RESULTS" \
+    > "logs/${name}.log"
+done
+```
+
+
 
 ## 主要参数
 
