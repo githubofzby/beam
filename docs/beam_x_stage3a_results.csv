@@ -1,6 +1,0 @@
-dataset,index,budget,algorithm_ms,exact_calls,committed_merges,cost_ratio_mags_compatible,positive_pair_recall,best_pair_recall
-random20,quotient-neighbor,8,,,,,0.97392,0.95000
-FA,legacy,16,328.688803,274635,2346,0.483725,,
-FA,quotient-neighbor,2,494.554892,118226,1484,0.704672,,
-FA,quotient-neighbor,4,425.677965,194093,2049,0.582508,,
-FA,quotient-neighbor,8,456.730899,351503,2256,0.551930,,
