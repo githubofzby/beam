@@ -1,0 +1,139 @@
+Loaded graph: n=1965206 m=5533214
+Seed: 1
+Divide hash dims: 16
+Divide max group: 512
+Merge mode: batch-ea-blocked
+Scoring backend: cpu
+Threshold policy: reciprocal
+CUDA scoring build: stub
+Output writing: disabled
+Iter 1: groups=914872 active_supernodes=1953600
+Iter 2: groups=908215 active_supernodes=1895558
+Iter 3: groups=887253 active_supernodes=1751402
+Iter 4: groups=837767 active_supernodes=1636793
+Iter 5: groups=795267 active_supernodes=1507151
+Iter 6: groups=753128 active_supernodes=1429775
+Iter 7: groups=727025 active_supernodes=1386062
+Iter 8: groups=712692 active_supernodes=1358688
+Iter 9: groups=702547 active_supernodes=1339515
+Iter 10: groups=695696 active_supernodes=1325353
+Iter 11: groups=690685 active_supernodes=1314761
+Iter 12: groups=686722 active_supernodes=1306718
+Iter 13: groups=683694 active_supernodes=1300218
+Iter 14: groups=681146 active_supernodes=1295192
+Iter 15: groups=678813 active_supernodes=1290954
+Iter 16: groups=677456 active_supernodes=1287418
+Iter 17: groups=676069 active_supernodes=1284507
+Iter 18: groups=674863 active_supernodes=1282031
+Iter 19: groups=674269 active_supernodes=1279954
+Iter 20: groups=673455 active_supernodes=1278139
+metric.n=1965206
+metric.input_edges_raw=2766607
+metric.graph_arcs=5533214
+metric.original_undirected_edges=2766607
+metric.original_edges_eval=2766607
+metric.iterations=20
+metric.seed=1
+metric.divide_hash_dims=16
+metric.divide_max_group=512
+metric.merge_mode=batch-ea-blocked
+metric.scoring_backend=cpu
+metric.threshold_policy=reciprocal
+metric.top_k=16
+metric.group_batch_size=64
+metric.candidate_batch_budget=0
+metric.cuda_slice_memory_mb=0
+metric.overflow_group_gmax=0
+metric.overflow_refine_rounds=0
+metric.error_bound=0.000000
+metric.supernode_count=1278139
+metric.P=698766
+metric.Cp=1230219
+metric.Cm=50607
+metric.encoding_cost=1979592
+metric.cost_ratio=0.715531
+metric.num_superedges_nonloop=656992
+metric.num_superedges_loop=41774
+metric.num_positive_corrections=1230219
+metric.num_negative_corrections=50607
+metric.encoding_cost_standard=1979592
+metric.cost_ratio_standard=0.715531
+metric.encoding_cost_mags_x2=3917410
+metric.encoding_cost_mags_compatible=1958705.000000
+metric.cost_ratio_mags_compatible=0.707981
+metric.compression_gain=0.284469
+metric.compression_java_style=0.284469
+metric.runtime_run_ms=95372.858114
+metric.runtime_divide_ms=26394.431364
+metric.runtime_merge_ms=68970.356255
+metric.divide_max_group_size=11
+metric.divide_fallback_splits=0
+metric.runtime_encode_ms=614.250934
+metric.runtime_output_ms=0.000000
+metric.runtime_algorithm_ms=95987.109048
+metric.runtime_end_to_end_ms=95987.109048
+metric.merge_prepare_wall_ms=5777.870716
+metric.merge_prepare_task_sum_ms=43237.484615
+metric.merge_create_w_ms=20156.267067
+metric.merge_scoring_ms=76406.644893
+metric.merge_candidate_gen_ms=21765.968080
+metric.merge_gain_scoring_ms=54640.676813
+metric.merge_selection_ms=78.396215
+metric.merge_update_ms=97.936259
+metric.merge_candidate_pairs=862286
+metric.merge_selected_pairs=687067
+metric.merge_total_local_gain=827343
+metric.merge_avg_local_gain=1.204166
+metric.merge_group_count=8251641
+metric.merge_group_max_size=11
+metric.merge_raw_pair_count=23069506
+metric.merge_candidate_pairs_after_prune=17636358
+metric.merge_exact_gain_calls=17636358
+metric.merge_positive_gain_pairs=862286
+metric.merge_rejected_by_overlap=175219
+metric.merge_rejected_by_threshold=16774072
+metric.merge_exact_gain_calls_per_selected=25.669051
+metric.merge_positive_gain_ratio=0.048893
+metric.threshold_last=0.047619
+metric.threshold_geom_last=0.047619
+metric.threshold_adaptive_last=0.047619
+metric.threshold_acceptance_scale=1.000000
+metric.threshold_acceptance_rate_last=0.000000
+metric.threshold_sample_count_last=0
+metric.cuda_init_ms=0.000000
+metric.cuda_h2d_ms=0.000000
+metric.cuda_row_h2d_ms=0.000000
+metric.cuda_pair_h2d_ms=0.000000
+metric.cuda_kernel_ms=0.000000
+metric.cuda_d2h_ms=0.000000
+metric.cuda_total_ms=0.000000
+metric.cuda_packed_h2d_ms=0.000000
+metric.cuda_packed_d2h_ms=0.000000
+metric.cuda_num_calls=0
+metric.cuda_row_uploads=0
+metric.cuda_kernel_launches=0
+metric.cuda_h2d_bytes=0
+metric.cuda_d2h_bytes=0
+metric.cuda_max_candidates_per_launch=0
+metric.cuda_packed_h2d_calls=0
+metric.cuda_packed_d2h_calls=0
+metric.cuda_packed_input_bytes=0
+metric.cuda_packed_output_bytes=0
+metric.cuda_slice_count=0
+metric.cuda_blocks_single_slice=0
+metric.cuda_blocks_multi_slice=0
+metric.cuda_max_slice_rows=0
+metric.cuda_max_slice_nnz=0
+metric.cuda_max_slice_candidates=0
+metric.cuda_slice_memory_budget_bytes=0
+metric.overflow_groups_seen=0
+metric.overflow_refined_subgroups=0
+metric.overflow_forced_chunks=0
+metric.overflow_max_group_before=0
+metric.overflow_max_group_after=0
+metric.overflow_refine_ms=0.000000
+metric.encode_relabel_ms=57.294966
+metric.encode_count_edges_ms=341.054511
+metric.encode_decision_ms=45.182570
+metric.encode_correction_generation_ms=55.873083
+metric.reconstruction_pass=unknown

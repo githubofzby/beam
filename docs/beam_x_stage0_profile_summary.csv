@@ -1,0 +1,8 @@
+dataset,iteration,mode,runtime_algorithm_ms
+FA,20,rounds,272.582691
+EM,20,rounds,1750.264215
+AM,20,rounds,9973.208662
+DB,20,rounds,9537.965261
+YO,20,rounds,50065.350315
+RN,20,rounds,75561.053913
+LJ,20,rounds,236713.884115
